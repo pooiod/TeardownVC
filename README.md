@@ -7,6 +7,7 @@ install the teardown mod from here [here](https://steamcommunity.com/sharedfiles
 
 ## Features
 - Proximity voice chat
+- Mute on death
 
 ## Planned features to add
 - Cave echoing
