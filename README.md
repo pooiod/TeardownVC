@@ -1,4 +1,4 @@
-# TeardownVC (super wip)
+# TeardownVC (super wip and untested)
 A simple voice chat system for Teardown.
 
 ## Getting started
