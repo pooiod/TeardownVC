@@ -17,7 +17,7 @@ try:
 except:
     psutil = None
 
-SAVE_TAG = "local-teardownvc"
+SAVE_TAG = "steam-3653434619" # "local-teardownvc"
 CLIENT_VERSION = 1
 SAVE_PATH = os.path.expandvars(r'%LOCALAPPDATA%\Teardown\savegame.xml')
 MQTT_BROKER = "broker.emqx.io"
