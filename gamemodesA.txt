@@ -1,0 +1,3 @@
+[Pooiod7's Voice chat mod]
+path = main.lua
+type = global
