@@ -16,7 +16,7 @@ install the teardown mod from here [here](https://steamcommunity.com/sharedfiles
 - More audio effects
 
 ## How it works
-The Teardown mod saves your player position into `%LocalAppData%\Teardown\savegame.xml` then the TDVP executable will read your save data and sync voices across clients
+The Teardown mod saves your player position into `%LocalAppData%\Teardown\savegame.xml` then the TDVC executable will read your save data and sync voices across clients
 
 ## Building your own
 The TDVP client is made in python
