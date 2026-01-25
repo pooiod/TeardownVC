@@ -2,7 +2,7 @@
 A simple voice chat system for Teardown.
 
 ## Getting started
-download the latest release from [here](https://github.com/pooiod/TeardownVC/releases)
+download the latest release from [here](https://github.com/pooiod/TeardownVC/releases) <br>
 install the teardown mod from here [here](https://steamcommunity.com/sharedfiles/filedetails/?id=3653434619)
 
 ## Features
