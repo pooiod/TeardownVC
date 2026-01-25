@@ -11,6 +11,7 @@ install the teardown mod from here [here](https://steamcommunity.com/sharedfiles
 ## Planned features to add
 - Cave echoing
 - Global voice chat
+- Support for multiple speakers (ex: walkie talkies)
 
 ## How it works
 The Teardown mod saves your player position into `%LocalAppData%\Teardown\savegame.xml` then the TDVP executable will read your save data and sync voices across clients
