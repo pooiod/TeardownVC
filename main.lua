@@ -64,7 +64,7 @@ function server.init()
     shared.user_map = {}
     shared.next_id = 1
 	shared.ShowPlayerMap = 0
-    DebugPrint("VC Server Initialized. Session: " .. shared.session_id)
+    -- DebugPrint("VC Server Initialized. Session: " .. shared.session_id)
 end
 
 function server.update(dt)
@@ -76,7 +76,7 @@ function server.update(dt)
             map[c.name] = shared.next_id
             shared.next_id = shared.next_id + 1
             changed = true
-            DebugPrint("Assigned VC ID " .. map[c.name] .. " to " .. c.name)
+            -- DebugPrint("Assigned VC ID " .. map[c.name] .. " to " .. c.name)
         end
     end
     if changed then shared.user_map = map end
