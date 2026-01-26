@@ -2,90 +2,68 @@
 
 local VERSION = 1
 local cache = {}
-local echoTimer = 0
-local ECHO_CALC_INTERVAL = 0.5
-local ECHO_SPHERE_RADIUS = 100
-
-local MATERIAL_ECHO_SCORES = {
-    ["glass"] = 1,
-    ["concrete"] = 3,
-    ["rock"] = 5,
-    ["grass"] = -5,
-    ["plaster"] = -8
-}
 
 function updateInt(key, val, force)
-    if cache[key] ~= val then
+    if force or cache[key] ~= val then
         SetInt("savegame.mod." .. key, val)
         cache[key] = val
     end
 end
 
-function calculateEnvironmentEcho()
-    local pos = GetPlayerPos()
-    local totalScore = 0
-    local radiusSq = ECHO_SPHERE_RADIUS * ECHO_SPHERE_RADIUS
-    
-    local voxels = QueryVoxels(pos, {ECHO_SPHERE_RADIUS, ECHO_SPHERE_RADIUS, ECHO_SPHERE_RADIUS})
-    
-    for i=1, #voxels, 4 do
-        local vx, vy, vz, matId = voxels[i], voxels[i+1], voxels[i+2], voxels[i+3]
-        
-        local dx, dy, dz = vx - pos[1], vy - pos[2], vz - pos[3]
-        if dx*dx + dy*dy + dz*dz <= radiusSq then
-            local mat = GetMaterial(matId)
-            
-            if MATERIAL_ECHO_SCORES[mat.name] then
-                totalScore = totalScore + MATERIAL_ECHO_SCORES[mat.name]
-            else
-                if mat.hardness < 0.3 then
-                    totalScore = totalScore - 2
-                elseif mat.hardness < 1.0 then
-                    totalScore = totalScore + 1
-                else
-                    totalScore = totalScore + 2
-                end
-            end
-        end
-    end
-    
-    local echoMs = math.floor(math.max(0, math.min(2000, 50 + totalScore * 0.2)))
-    
-    if echoMs < 30 then
-        echoMs = 0
-    end
-    
-    updateInt("echo", echoMs)
-end
-
-
 function server.init()
-    shared.session_id = math.random(1000, 9999)
+    math.randomseed(os.time())
     shared.user_map = {}
-    shared.next_id = 1
     shared.ShowPlayerMap = 0
+    shared.session_id = math.random(1000, 9999)
 end
 
 function server.update(dt)
+    if not shared.session_id then
+        shared.session_id = math.random(1000, 9999)
+    end
+
     local clients = Network.GetClients()
     local map = shared.user_map
     local changed = false
 
+    local activeKeys = {}
+
     for i, c in ipairs(clients) do
-        local uniqueKey = c.name .. "_" .. tostring(i) 
-        
+        local uniqueKey = c.name .. "_" .. tostring(c.player)
+        activeKeys[uniqueKey] = true
+
         if not map[uniqueKey] then
-            map[uniqueKey] = shared.next_id
-            shared.next_id = shared.next_id + 1
+            local rndId
+            local collision
+            
+            repeat
+                rndId = math.random(100000, 9999999)
+                collision = false
+                for _, id in pairs(map) do
+                    if id == rndId then 
+                        collision = true 
+                        break 
+                    end
+                end
+            until not collision
+
+            map[uniqueKey] = rndId
             changed = true
         end
     end
-    if changed then shared.user_map = map end
+
+    if changed then 
+        shared.user_map = map 
+    end
 end
 
 function client.tick(dt)
     updateInt("version", VERSION)
-    if shared.session_id then updateInt("session", shared.session_id) end
+    if shared.session_id then 
+        updateInt("session", shared.session_id) 
+    else
+        updateInt("session", 0)
+    end
     
     local myName = GetUserNickname()
     local myId = 0
@@ -94,7 +72,8 @@ function client.tick(dt)
         local clients = Network.GetClients()
         for i, c in ipairs(clients) do
             if c.name == myName and c.player == GetPlayer() then
-                local uniqueKey = c.name .. "_" .. tostring(i)
+                local uniqueKey = c.name .. "_" .. tostring(c.player)
+
                 if shared.user_map and shared.user_map[uniqueKey] then
                     myId = shared.user_map[uniqueKey]
                 end
@@ -102,9 +81,13 @@ function client.tick(dt)
             end
         end
     else
-        myId = 1
+        if not shared.user_map then shared.user_map = {} end
+        if not shared.user_map["local"] then
+            shared.user_map["local"] = math.random(100000, 999999)
+        end
+        myId = shared.user_map["local"]
     end
-    
+
     updateInt("userid", myId)
 
     local pos = GetPlayerPos()
@@ -122,7 +105,6 @@ function client.tick(dt)
     updateInt("isowner", is_owner)
 
     updateInt("global", 0)
-    updateInt("showmap", shared.ShowPlayerMap)
-
+    updateInt("showmap", shared.ShowPlayerMap or 0)
     updateInt("echo", 0)
 end
