@@ -204,7 +204,7 @@ class VoiceChat:
         self.pa = pyaudio.PyAudio()
         self.client = mqtt.Client(transport="websockets")
         self.client.on_connect = self.on_mqtt_connect
-        self.client.on_message = self.on_mqtt_message
+        # self.client.on_message = self.on_mqtt_message
         self.client.on_subscribe = self.on_mqtt_subscribe
         self.client.tls_set()
         try: self.mic_id = self.pa.get_default_input_device_info()['index']
@@ -217,7 +217,7 @@ class VoiceChat:
         self.peers = {}
         self.levels = {}
         self.audio_queues = {}
-        self.settings = {'hear_self': False, 'mic_gain': 1.0, 'master_vol': 1.0}
+        self.settings = {'hear_self': False, 'mic_gain': 1, 'master_vol': 1}
         self.client.connect(MQTT_BROKER, MQTT_PORT)
         self.client.loop_start()
 
@@ -265,13 +265,13 @@ class VoiceChat:
                     cur_echo = self.local.get("echo", 0)
                     if cur_echo != last_echo:
                         last_echo = cur_echo
-                        echo_buf = np.zeros(int(RATE * (max(0, cur_echo)/1000.0)), dtype=np.int16)
+                        echo_buf = np.zeros(int(RATE * (max(0, cur_echo)/1000)), dtype=np.int16)
 
                     in_np = np.zeros(CHUNK, dtype=np.int16)
                     try:
                         raw = sin.read(CHUNK, exception_on_overflow=False)
                         in_np = np.frombuffer(raw, dtype=np.int16)
-                        if self.settings['mic_gain'] != 1.0:
+                        if self.settings['mic_gain'] != 1:
                             in_np = (in_np.astype(np.float32) * self.settings['mic_gain']).clip(-32768, 32767).astype(np.int16)
 
                         self.levels[str(self.local["id"])] = np.abs(in_np).mean()
@@ -303,7 +303,7 @@ class VoiceChat:
                             del q[:byte_size]
                             pcm = np.frombuffer(chunk_bytes, dtype=np.int16).astype(np.float32)
                             p_meta = self.peers.get(uid, {})
-                            vl, vr = (1.0, 1.0) if p_meta.get("global") else self.spatial_calc(p_meta)
+                            vl, vr = (1, 1) if p_meta.get("global") else self.spatial_calc(p_meta)
                             self.levels[uid] = np.abs(pcm).mean() * ((vl + vr) / 2)
                             mix[0::2] += pcm * vl; mix[1::2] += pcm * vr
                         except: continue
@@ -331,9 +331,9 @@ class VoiceChat:
         if not p: return 0.5, 0.5
         dx, dz = p.get("x", 0) - self.local["x"], p.get("z", 0) - self.local["z"]
         dist = math.sqrt(dx*dx + dz*dz)
-        vol = max(0, 1.0 - (dist / 45.0))
-        pan = np.clip(dx / 15.0, -0.8, 0.8)
-        return vol * (1.0 - pan), vol * (1.0 + pan)
+        vol = max(0, 1 - (dist / 45))
+        pan = np.clip(dx / -15, -0.8, 0.8)
+        return vol * (1 - pan), vol * (1 + pan)
 
     def teardown_monitor(self):
         ls = -1
