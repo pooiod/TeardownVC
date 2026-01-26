@@ -14,7 +14,7 @@ local MATERIAL_ECHO_SCORES = {
     ["plaster"] = -8
 }
 
-function updateInt(key, val)
+function updateInt(key, val, force)
     if cache[key] ~= val then
         SetInt("savegame.mod." .. key, val)
         cache[key] = val
@@ -63,20 +63,21 @@ function server.init()
     shared.session_id = math.random(1000, 9999)
     shared.user_map = {}
     shared.next_id = 1
-	shared.ShowPlayerMap = 0
-    -- DebugPrint("VC Server Initialized. Session: " .. shared.session_id)
+    shared.ShowPlayerMap = 0
 end
 
 function server.update(dt)
     local clients = Network.GetClients()
     local map = shared.user_map
     local changed = false
-    for _, c in ipairs(clients) do
-        if not map[c.name] then
-            map[c.name] = shared.next_id
+
+    for i, c in ipairs(clients) do
+        local uniqueKey = c.name .. "_" .. tostring(i) 
+        
+        if not map[uniqueKey] then
+            map[uniqueKey] = shared.next_id
             shared.next_id = shared.next_id + 1
             changed = true
-            -- DebugPrint("Assigned VC ID " .. map[c.name] .. " to " .. c.name)
         end
     end
     if changed then shared.user_map = map end
@@ -87,7 +88,24 @@ function client.tick(dt)
     if shared.session_id then updateInt("session", shared.session_id) end
     
     local myName = GetUserNickname()
-    if shared.user_map and shared.user_map[myName] then updateInt("userid", shared.user_map[myName]) end
+    local myId = 0
+    
+    if Network and Network.IsConnected() then
+        local clients = Network.GetClients()
+        for i, c in ipairs(clients) do
+            if c.name == myName and c.player == GetPlayer() then
+                local uniqueKey = c.name .. "_" .. tostring(i)
+                if shared.user_map and shared.user_map[uniqueKey] then
+                    myId = shared.user_map[uniqueKey]
+                end
+                break
+            end
+        end
+    else
+        myId = 1
+    end
+    
+    updateInt("userid", myId)
 
     local pos = GetPlayerPos()
     updateInt("pos_x", math.floor(pos[1] * 100))
@@ -102,14 +120,9 @@ function client.tick(dt)
         if Network.GetClients()[1].name == myName then is_owner = 1 end
     else is_owner = 1 end
     updateInt("isowner", is_owner)
-    
-    updateInt("global", 0)
-	updateInt("showmap", shared.ShowPlayerMap)
 
-    -- echoTimer = echoTimer + dt
-    -- if echoTimer >= ECHO_CALC_INTERVAL then
-    --     echoTimer = 0
-    --     calculateEnvironmentEcho()
-    -- end
+    updateInt("global", 0)
+    updateInt("showmap", shared.ShowPlayerMap)
+
     updateInt("echo", 0)
 end
