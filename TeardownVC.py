@@ -69,7 +69,7 @@ HTML = """
         <select id="mic" onchange="setIO()"></select> <select id="spk" onchange="setIO()"></select>
     </div>
     <div class="card">
-        <div class="header-info">
+        <div class="header-info" id="playerlist">
             <h3>Players</h3>
             <span style="font-size: 12px; color: #888;">Room ID: <b id="session-id">0</b></span>
         </div>
@@ -109,6 +109,8 @@ HTML = """
                 row.innerHTML = `<div class="p-info"><div class="p-name">${p.name} ${p.local ? '(You)' : ''}</div><div class="p-sub">Player ${p.id}, Echo: ${p.echo}ms</div></div><div class="meter"><div class="fill" style="width: ${p.vol}%"></div></div>`;
                 document.getElementById('list').appendChild(row);
             });
+            if (p.length > 1) document.getElementById('playerlist').style.display = "";
+            else document.getElementById('playerlist').style.display = "none";
             drawMap(data.players, data.show_map);
         }
         function drawMap(players, show) {
@@ -203,7 +205,6 @@ class VoiceChat:
         self.client = mqtt.Client(transport="websockets")
         self.client.on_connect = self.on_mqtt_connect
         self.client.on_message = self.on_mqtt_message
-        # self.client.on_log = self.on_mqtt_log
         self.client.on_subscribe = self.on_mqtt_subscribe
         self.client.tls_set()
         try: self.mic_id = self.pa.get_default_input_device_info()['index']
@@ -219,9 +220,6 @@ class VoiceChat:
         self.settings = {'hear_self': False, 'mic_gain': 1.0, 'master_vol': 1.0}
         self.client.connect(MQTT_BROKER, MQTT_PORT)
         self.client.loop_start()
-
-    def on_mqtt_log(self, client, userdata, level, buf):
-        print(f"[MQTT DEBUG] {buf}")
 
     def on_mqtt_connect(self, client, userdata, flags, rc):
         print(f"[MQTT] Connected with code {rc}")
@@ -262,29 +260,40 @@ class VoiceChat:
                 self.restart_trigger = False
                 last_echo, echo_buf = -1, np.zeros(1, dtype=np.int16)
                 send_acc = bytearray()
+
                 while self.running and not self.restart_trigger:
                     cur_echo = self.local.get("echo", 0)
                     if cur_echo != last_echo:
                         last_echo = cur_echo
                         echo_buf = np.zeros(int(RATE * (max(0, cur_echo)/1000.0)), dtype=np.int16)
+
+                    in_np = np.zeros(CHUNK, dtype=np.int16)
                     try:
                         raw = sin.read(CHUNK, exception_on_overflow=False)
                         in_np = np.frombuffer(raw, dtype=np.int16)
                         if self.settings['mic_gain'] != 1.0:
                             in_np = (in_np.astype(np.float32) * self.settings['mic_gain']).clip(-32768, 32767).astype(np.int16)
-                    except: continue
-                    self.levels[str(self.local["id"])] = np.abs(in_np).mean()
+
+                        self.levels[str(self.local["id"])] = np.abs(in_np).mean()
+                    except Exception as e:
+                        in_np = np.zeros(CHUNK, dtype=np.int16)
+                        self.levels[str(self.local["id"])] = 0
+
                     ec = (echo_buf[:CHUNK] * 0.4).astype(np.int16) if len(echo_buf) >= CHUNK else 0
                     snd = np.add(in_np, ec, casting="unsafe")
+
                     if len(echo_buf) >= CHUNK:
                         echo_buf = np.roll(echo_buf, -CHUNK); echo_buf[-CHUNK:] = snd
+
                     if not self.local["dead"]:
                         send_acc.extend(snd.tobytes())
                         if len(send_acc) >= (RATE * 2):
                             self.client.publish(f"tdvc/{self.local['session']}/audio/{self.local['id']}", bytes(send_acc), qos=0)
                             send_acc = bytearray()
+                    
                     mix = np.zeros(CHUNK * 2, dtype=np.float32)
                     byte_size = CHUNK * 2
+                    
                     for uid, q in list(self.audio_queues.items()):
                         if len(q) < byte_size:
                             self.levels[uid] = 0
@@ -298,10 +307,15 @@ class VoiceChat:
                             self.levels[uid] = np.abs(pcm).mean() * ((vl + vr) / 2)
                             mix[0::2] += pcm * vl; mix[1::2] += pcm * vr
                         except: continue
+                    
                     if self.settings['hear_self'] and not self.local["dead"]:
                         mix[0::2] += snd.astype(np.float32); mix[1::2] += snd.astype(np.float32)
+                    
                     out_pcm = (mix * self.settings['master_vol']).clip(-32768, 32767).astype(np.int16)
-                    sout.write(out_pcm.tobytes())
+                    try:
+                        sout.write(out_pcm.tobytes())
+                    except: pass
+
             except Exception as e:
                 print(f"[AUDIO ERR] {e}")
                 time.sleep(1)
@@ -333,15 +347,37 @@ class VoiceChat:
                         mm = re.search(rf'<{k}\s+value="([^"]*)"', inner)
                         return int(mm.group(1)) if mm else default
                     cs = g("session", 0)
+
                     if cs != ls:
                         if ls > 0:
                             self.client.publish(f"tdvc/{ls}/data/{self.local['id']}", payload=None, retain=True)
                             self.client.unsubscribe(f"tdvc/{ls}/#")
-                        if cs > 0: self.client.subscribe(f"tdvc/{cs}/#")
-                        self.peers.clear(); self.audio_queues.clear(); ls = cs; self.restart_trigger = True
-                    self.local.update({"id": g("userid", 0), "x": g("pos_x", 0)/100, "y": g("pos_y", 0)/100, "z": g("pos_z", 0)/100, "dead": g("isdead", 1), "session": cs, "global": g("global", 0), "show_map": g("showmap", 0), "echo": g("echo", 0)})
-                    if cs > 0: self.client.publish(f"tdvc/{cs}/data/{self.local['id']}", json.dumps(self.local), qos=0, retain=True)
-                except: pass
+                        
+                        if cs > 0:
+                            print(f"[MONITOR] Joining Session {cs}")
+                            self.client.subscribe(f"tdvc/{cs}/#")
+                            self.peers.clear()
+                            self.audio_queues.clear()
+                        
+                        ls = cs
+                        self.restart_trigger = True
+
+                    self.local.update({
+                        "id": g("userid", 0), 
+                        "x": g("pos_x", 0)/100, 
+                        "y": g("pos_y", 0)/100, 
+                        "z": g("pos_z", 0)/100, 
+                        "dead": g("isdead", 1), 
+                        "session": cs, 
+                        "global": g("global", 0), 
+                        "show_map": g("showmap", 0), 
+                        "echo": g("echo", 0)
+                    })
+                    
+                    if cs > 0 and self.local["id"] != 0:
+                         self.client.publish(f"tdvc/{cs}/data/{self.local['id']}", json.dumps(self.local), qos=0, retain=True)
+                except Exception as e:
+                     print(f"[MONITOR ERR] {e}")
             time.sleep(0.3)
 
     def is_teardown_running(self):
