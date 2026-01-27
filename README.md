@@ -23,4 +23,4 @@ The TeardownVC client reads this data to find out where to play audio from.
 The TeardownVC client is written in Python. <br>
 You can compile it using tools like: [auto-py-to-exe](https://pypi.org/project/auto-py-to-exe/) <br>
 To use the mod in multiplayer, you must publish it to the Steam Workshop. 
-After publishing, set the `SAVE_TAG` value in `savegame.xml` to the mod’s Steam Workshop ID.
+After publishing, set the `SAVE_TAG` value to the to the mod’s Steam Workshop ID. (ex: `steam-3653434619`)
