@@ -1,0 +1,333 @@
+<!DOCTYPE html>
+<html>
+<head>
+    <title>TeardownVC Web Client</title>
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/paho-mqtt/1.0.1/mqttws31.min.js"></script>
+    <style>
+        body { --sb-track-color: #000000; --sb-thumb-color: #ffffff; --sb-size: 14px; } body::-webkit-scrollbar { width: var(--sb-size) } body::-webkit-scrollbar-track { background: var(--sb-track-color); } body::-webkit-scrollbar-thumb { background: var(--sb-thumb-color); border-radius: 10px; border: 4px solid #000000; } @supports not selector(::-webkit-scrollbar) { body { scrollbar-color: var(--sb-thumb-color) var(--sb-track-color); } }
+        body { background: #111; color: #eee; font-family: sans-serif; padding: 15px; user-select: none; }
+        .card { background: #1f1f1f; border-radius: 8px; padding: 15px; margin-bottom: 15px; border: 1px solid #333; }
+        h3 { margin: 0 0 10px 0; color: #00ffaa; font-size: 14px; text-transform: uppercase; }
+        select { background: #333; color: white; border: 1px solid #444; padding: 8px; width: 100%; margin-bottom: 8px; border-radius: 4px; }
+        .p-row { display: flex; align-items: center; background: #252525; margin: 5px 0; padding: 8px; border-radius: 4px; }
+        .p-info { flex: 1; font-size: 13px; } .p-name { font-weight: bold; } .p-sub { font-size: 11px; color: #888; }
+        .meter { width: 80px; height: 8px; background: #000; border-radius: 4px; overflow: hidden; }
+        .fill { height: 100%; background: #00ffaa; width: 0%; transition: width 0.1s; }
+        .setting-row { display: flex; align-items: center; justify-content: space-between; margin: 10px 0; font-size: 13px; }
+        input[type="range"] { flex-grow: 1; margin: 0 10px; } input[type="checkbox"] { margin-right: 10px; }
+        .loader { position: fixed; top: 0; left: 0; width: 100%; height: 100%; background: rgba(0,0,0,0.85); display: flex; justify-content: center; align-items: center; z-index: 100; flex-direction: column; text-align: center; }
+        .spinner { border: 4px solid rgba(255,255,255,0.3); border-top: 4px solid #00ffaa; border-radius: 50%; width: 40px; height: 40px; animation: spin 1s linear infinite; margin-bottom: 20px; }
+        @keyframes spin { 0% { transform: rotate(0deg); } 100% { transform: rotate(360deg); } }
+        .header-info { display: flex; justify-content: space-between; align-items: center; }
+        #login-modal { position: fixed; top: 0; left: 0; width: 100%; height: 100%; background: rgba(0,0,0,0.9); display: flex; justify-content: center; align-items: center; z-index: 200; flex-direction: column; }
+        #login-modal input { margin: 5px; padding: 10px; border-radius: 5px; border: 1px solid #555; background: #333; color: white; width: 200px; text-align: center; }
+        #login-modal button { margin-top: 10px; padding: 10px 20px; border-radius: 5px; border: none; background: #00ffaa; color: #111; font-weight: bold; cursor: pointer; }
+    </style>
+</head>
+<body>
+    <div id="login-modal">
+        <h3>Teardown VC</h3>
+        <input type="text" id="username" placeholder="Enter Username">
+        <input type="number" id="session-id-input" placeholder="Enter Session ID">
+        <button onclick="start()">Join</button>
+    </div>
+    <div id="loader" class="loader" style="display: none;">
+        <div class="spinner"></div>
+        <h3 id="loader-text">Loading...</h3>
+    </div>
+    <div class="card">
+        <h3>Settings</h3>
+        <div class="setting-row"> <label>Hear Self</label> <input type="checkbox" id="hearSelf" onchange="updateSettings()"> </div>
+        <div class="setting-row"> <label>Mic Gain</label> <input type="range" id="micGain" min="0" max="200" value="100" oninput="updateSettings()"> <span id="micGainLabel">100%</span> </div>
+        <div class="setting-row"> <label>VC Volume</label> <input type="range" id="masterVol" min="0" max="150" value="100" oninput="updateSettings()"> <span id="masterVolLabel">100%</span> </div>
+    </div>
+    <div class="card">
+        <div class="header-info" id="playerlist-header">
+            <h3>Players</h3>
+            <span style="font-size: 12px; color: #888;">Room ID: <b id="session-id-display">0</b></span>
+        </div>
+        <div id="list"></div>
+    </div>
+
+    <script>
+        const MQTT_BROKER = "broker.emqx.io";
+        const MQTT_PORT = 8084;
+        const CHUNK_SIZE = 512;
+        const RATE = 8000;
+        const AUDIO_SNIP_SECONDS = 1;
+        const STALE_TIMEOUT = 10000;
+
+        let client, audioContext, scriptNode, gainNode, masterGainNode;
+        let local = { id: 0, name: "Player", x: 0, y: 0, z: 0, dead: 0, session: 0, global: 1, show_map: 0, echo: 0 };
+        let peers = {};
+        let audioQueues = {};
+        let levels = {};
+        let settings = { hear_self: false, mic_gain: 1, master_vol: 1 };
+        let send_acc = new Int16Array(0);
+
+        function setCookie(name, value, days) {
+            let expires = "";
+            if (days) {
+                const date = new Date();
+                date.setTime(date.getTime() + (days * 24 * 60 * 60 * 1000));
+                expires = "; expires=" + date.toUTCString();
+            }
+            document.cookie = name + "=" + (value || "") + expires + "; path=/; SameSite=Lax";
+        }
+
+        function getCookie(name) {
+            const nameEQ = name + "=";
+            const ca = document.cookie.split(';');
+            for (let i = 0; i < ca.length; i++) {
+                let c = ca[i];
+                while (c.charAt(0) == ' ') c = c.substring(1, c.length);
+                if (c.indexOf(nameEQ) == 0) return c.substring(nameEQ.length, c.length);
+            }
+            return null;
+        }
+
+        function generateUserId(name) {
+            let hash = 0;
+            if (name.length === 0) return hash;
+            for (let i = 0; i < name.length; i++) {
+                const char = name.charCodeAt(i);
+                hash = ((hash << 5) - hash) + char;
+                hash |= 0;
+            }
+            return Math.abs(hash);
+        }
+
+        function start() {
+            local.name = document.getElementById('username').value || 'Player';
+            setCookie('teardownVCUsername', local.name, 365);
+            local.session = parseInt(document.getElementById('session-id-input').value) || 0;
+            local.id = generateUserId(local.name);
+
+            if (local.session === 0) {
+                alert("Please enter a valid Session ID.");
+                return;
+            }
+
+            document.getElementById('login-modal').style.display = 'none';
+            document.getElementById('loader').style.display = 'flex';
+            document.getElementById('loader-text').innerText = 'Connecting to server...';
+            document.getElementById('session-id-display').innerText = local.session;
+
+            client = new Paho.MQTT.Client(MQTT_BROKER, MQTT_PORT, "tdvc-web-" + Date.now());
+            client.onConnectionLost = onConnectionLost;
+            client.onMessageArrived = onMessageArrived;
+            client.connect({ useSSL: true, onSuccess: onConnect, onFailure: onFailure });
+        }
+
+        function onConnect() {
+            document.getElementById('loader-text').innerText = 'Connecting audio...';
+            client.subscribe(`tdvc/${local.session}/#`);
+            setInterval(publishData, 300);
+            setInterval(render, 100);
+            initAudio();
+        }
+
+        function onFailure(response) {
+            document.getElementById('loader-text').innerText = `Failed to connect: ${response.errorMessage}`;
+        }
+
+        function onConnectionLost(responseObject) {
+            if (responseObject.errorCode !== 0) {
+                document.getElementById('loader').style.display = 'flex';
+                document.getElementById('loader-text').innerText = 'Connection Lost. Reconnecting...';
+                setTimeout(() => client.connect({ useSSL: true, onSuccess: onConnect, onFailure: onFailure }), 3000);
+            }
+        }
+
+        function onMessageArrived(message) {
+            try {
+                const topicParts = message.destinationName.split("/");
+                const topicType = topicParts[2];
+                const uid = topicParts[3];
+
+                if (topicType === "audio") {
+                    if (uid == local.id) return;
+                    if (!audioQueues[uid]) {
+                        audioQueues[uid] = [];
+                    }
+                    const pcm = new Int16Array(message.payloadBytes.buffer);
+                    for(let i = 0; i < pcm.length; i++){
+                        audioQueues[uid].push(pcm[i] / 32768.0);
+                    }
+                } else if (topicType === "data") {
+                    if (message.payloadString.length === 0) {
+                        if (peers[uid]) delete peers[uid];
+                        return;
+                    }
+                    const p = JSON.parse(message.payloadString);
+                    if (p.id == local.id) return;
+                    peers[String(p.id)] = p;
+                    peers[String(p.id)].lastSeen = Date.now();
+                }
+            } catch (e) {
+                console.error("Error processing message:", e);
+            }
+        }
+
+        async function initAudio() {
+            try {
+                const stream = await navigator.mediaDevices.getUserMedia({ audio: { sampleRate: RATE, channelCount: 1, echoCancellation: true, noiseSuppression: true } });
+                audioContext = new (window.AudioContext || window.webkitAudioContext)({ sampleRate: RATE });
+                scriptNode = audioContext.createScriptProcessor(CHUNK_SIZE, 1, 1);
+                
+                const source = audioContext.createMediaStreamSource(stream);
+                gainNode = audioContext.createGain();
+                masterGainNode = audioContext.createGain();
+
+                source.connect(gainNode);
+                gainNode.connect(scriptNode);
+                scriptNode.connect(masterGainNode);
+                masterGainNode.connect(audioContext.destination);
+
+                scriptNode.onaudioprocess = processAudio;
+                
+                document.getElementById('loader').style.display = 'none';
+                updateSettings();
+
+            } catch (e) {
+                document.getElementById('loader-text').innerText = `Audio Error: ${e.message}`;
+            }
+        }
+        
+        function processAudio(audioProcessingEvent) {
+            const inputBuffer = audioProcessingEvent.inputBuffer;
+            const outputBuffer = audioProcessingEvent.outputBuffer;
+            const inputData = inputBuffer.getChannelData(0);
+            const outputData = outputBuffer.getChannelData(0);
+
+            let mixed = new Float32Array(CHUNK_SIZE).fill(0);
+            for(const uid in audioQueues){
+                let volSum = 0;
+                let samplesProcessed = 0;
+                for(let i=0; i<CHUNK_SIZE; i++){
+                    if(audioQueues[uid] && audioQueues[uid].length > 0) {
+                        const sample = audioQueues[uid].shift();
+                        mixed[i] += sample;
+                        volSum += Math.abs(sample);
+                        samplesProcessed++;
+                    } else {
+                        break;
+                    }
+                }
+                if (samplesProcessed > 0) {
+                    levels[uid] = volSum / samplesProcessed;
+                }
+            }
+            
+            for (let i = 0; i < CHUNK_SIZE; i++) {
+                outputData[i] = mixed[i];
+            }
+
+            if (settings.hear_self) {
+                 for (let i = 0; i < CHUNK_SIZE; i++) {
+                    outputData[i] += inputData[i];
+                }
+            }
+
+            let localVolSum = 0;
+            const int16Data = new Int16Array(CHUNK_SIZE);
+            for(let i=0; i<CHUNK_SIZE; i++){
+                localVolSum += Math.abs(inputData[i]);
+                int16Data[i] = Math.max(-32768, Math.min(32767, inputData[i] * 32767));
+            }
+            levels[local.id] = localVolSum / CHUNK_SIZE;
+
+            const new_send_acc = new Int16Array(send_acc.length + int16Data.length);
+            new_send_acc.set(send_acc);
+            new_send_acc.set(int16Data, send_acc.length);
+            send_acc = new_send_acc;
+
+            if(send_acc.length >= RATE * AUDIO_SNIP_SECONDS) {
+                const message = new Paho.MQTT.Message(send_acc.buffer);
+                message.destinationName = `tdvc/${local.session}/audio/${local.id}`;
+                client.send(message);
+                send_acc = new Int16Array(0);
+            }
+        }
+        
+        function publishData() {
+            if (client && client.isConnected()) {
+                const message = new Paho.MQTT.Message(JSON.stringify(local));
+                message.destinationName = `tdvc/${local.session}/data/${local.id}`;
+                message.retained = true;
+                client.send(message);
+            }
+        }
+
+        function updateSettings() {
+            settings = {
+                hear_self: document.getElementById('hearSelf').checked,
+                mic_gain: document.getElementById('micGain').value / 100,
+                master_vol: document.getElementById('masterVol').value / 100
+            };
+            if(gainNode) gainNode.gain.value = settings.mic_gain;
+            if(masterGainNode) masterGainNode.gain.value = settings.master_vol;
+            document.getElementById('micGainLabel').innerText = `${Math.round(settings.mic_gain * 100)}%`;
+            document.getElementById('masterVolLabel').innerText = `${Math.round(settings.master_vol * 100)}%`;
+        }
+        
+        function render() {
+            const list = document.getElementById('list');
+            list.innerHTML = '';
+            
+            let players = [ { ...local, local: true } ];
+            
+            const now = Date.now();
+            for (const uid in peers) {
+                if (now - peers[uid].lastSeen < STALE_TIMEOUT) {
+                    players.push(peers[uid]);
+                } else {
+                    delete peers[uid];
+                }
+            }
+            
+            players.forEach(p => {
+                if (levels[p.id]) {
+                    levels[p.id] *= 0.85; 
+                    if (levels[p.id] < 0.001) levels[p.id] = 0;
+                }
+                const vol = levels[p.id] || 0;
+                const volPercent = Math.min(100, Math.floor(vol * 800)); 
+
+                const row = document.createElement('div');
+                row.className = 'p-row';
+                row.style.color = (p.dead ? '#ff5555' : 'white');
+
+                row.innerHTML = `
+                    <div class="p-info">
+                        <div class="p-name">${p.name} ${p.local ? '(You)' : ''}</div>
+                        <div class="p-sub">Player ${p.id}</div>
+                    </div>
+                    <div class="meter">
+                        <div class="fill" style="width: ${volPercent}%"></div>
+                    </div>`;
+                list.appendChild(row);
+            });
+            document.getElementById('playerlist-header').style.display = players.length > 0 ? "flex" : "none";
+        }
+        
+        window.addEventListener('load', () => {
+            const savedUsername = getCookie('teardownVCUsername');
+            if (savedUsername) {
+                document.getElementById('username').value = savedUsername;
+            }
+        });
+
+        window.addEventListener('beforeunload', () => {
+             if (client && client.isConnected()) {
+                const message = new Paho.MQTT.Message("");
+                message.destinationName = `tdvc/${local.session}/data/${local.id}`;
+                message.retained = true;
+                client.send(message);
+                client.disconnect();
+            }
+        });
+
+    </script>
+</body>
+</html>
