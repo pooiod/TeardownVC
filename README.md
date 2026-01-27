@@ -6,12 +6,12 @@ TeardownVC is a simple proximity voice chat system for Teardown.
 2. Install the Teardown mod [steamcommunity.com/sharedfiles/filedetails/?id=3653434619](https://steamcommunity.com/sharedfiles/filedetails/?id=3653434619)
 
 ## Features
-- Proximity voice chat  
+- Proximity voice chat
+- Global voice chat
 - Automatic mute on player death
 
 ## Planned features
 - Cave echoing
-- Global voice chat
 - Multiple audio sources (ex: walkie-talkies)
 - More audio effects
 
