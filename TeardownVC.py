@@ -30,7 +30,7 @@ AUDIO_SNIP_SECONDS = 1
 MAX_QUEUE_SECONDS = 4
 STALE_TIMEOUT = 10
 FADE_SECONDS = 1
-RESET_SESSION_ON_START = False
+RESET_SESSION_ON_START = True
 
 HTML = """
 <!DOCTYPE html>
@@ -559,3 +559,4 @@ if __name__ == "__main__":
         webview.start()
         if v.local["session"] > 0: v.client.publish(f"tdvc/{v.local['session']}/data/{v.local['id']}", payload=None, retain=True)
         v.running = False
+
