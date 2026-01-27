@@ -13,6 +13,7 @@ TeardownVC is a simple proximity voice chat system for Teardown.
 ## Planned features
 - Cave echoing
 - Multiple audio sources (ex: walkie-talkies)
+- Doppler effect
 - More audio effects
 
 ## How it works
