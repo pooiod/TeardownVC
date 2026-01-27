@@ -1,6 +1,6 @@
 #version 2
 
-local VERSION = 1
+local VERSION = 2
 local cache = {}
 
 local notif_duration = 5.0

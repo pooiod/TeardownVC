@@ -18,7 +18,7 @@ except:
     psutil = None
 
 SAVE_TAG = "steam-3653434619"
-CLIENT_VERSION = 1
+CLIENT_VERSION = 2
 SAVE_PATH = os.path.expandvars(r'%LOCALAPPDATA%\Teardown\savegame.xml')
 MQTT_BROKER = "broker.emqx.io"
 MQTT_PORT = 8084
@@ -26,6 +26,11 @@ CHUNK = 512
 FORMAT = pyaudio.paInt16
 CHANNELS = 1
 RATE = 8000
+AUDIO_SNIP_SECONDS = 1
+MAX_QUEUE_SECONDS = 4
+STALE_TIMEOUT = 10
+FADE_SECONDS = 1
+RESET_SESSION_ON_START = False
 
 HTML = """
 <!DOCTYPE html>
@@ -109,7 +114,7 @@ HTML = """
                 row.innerHTML = `<div class="p-info"><div class="p-name">${p.name} ${p.local ? '(You)' : ''}</div><div class="p-sub">Player ${p.id}, Echo: ${p.echo}ms</div></div><div class="meter"><div class="fill" style="width: ${p.vol}%"></div></div>`;
                 document.getElementById('list').appendChild(row);
             });
-            if (p.length > 1) document.getElementById('playerlist').style.display = "";
+            if (data.players.length > 1) document.getElementById('playerlist').style.display = "";
             else document.getElementById('playerlist').style.display = "none";
             drawMap(data.players, data.show_map);
         }
@@ -120,20 +125,25 @@ HTML = """
             const canvas = document.getElementById('minimap');
             const ctx = canvas.getContext('2d');
             canvas.width = canvas.offsetWidth; canvas.height = canvas.offsetHeight;
-            let minX = players[0].x, maxX = players[0].x, minZ = players[0].z, maxZ = players[0].z;
+            let minX = players[0].x, maxX = players[0].x, minY = players[0].y, maxY = players[0].y, minZ = players[0].z, maxZ = players[0].z;
             players.forEach(p => {
                 if (p.x < minX) minX = p.x; if (p.x > maxX) maxX = p.x;
+                if (p.y < minY) minY = p.y; if (p.y > maxY) maxY = p.y;
                 if (p.z < minZ) minZ = p.z; if (p.z > maxZ) maxZ = p.z;
             });
-            const worldSize = Math.max(20, maxX - minX, maxZ - minZ) * 1.2;
+            const worldSize = Math.max(20, maxX - minX, maxZ - minZ, maxY - minY) * 1.2;
             const zoom = canvas.width / worldSize;
             const centerX = (minX + maxX) / 2;
             const centerZ = (minZ + maxZ) / 2;
+            const minYval = minY, maxYval = maxY;
             ctx.clearRect(0, 0, canvas.width, canvas.height);
             players.forEach(p => {
                 const cx = (p.x - centerX) * zoom + canvas.width / 2;
                 const cz = (p.z - centerZ) * zoom + canvas.height / 2;
-                ctx.beginPath(); ctx.arc(cx, cz, 5, 0, 2 * Math.PI);
+                let heightFactor = 0;
+                if (maxYval > minYval) heightFactor = (p.y - minYval) / (maxYval - minYval);
+                const radius = 4 + Math.round(heightFactor * 6);
+                ctx.beginPath(); ctx.arc(cx, cz, radius, 0, 2 * Math.PI);
                 ctx.fillStyle = p.local ? '#00ffaa' : '#ffaa00'; ctx.fill();
             });
         }
@@ -194,7 +204,8 @@ def force_reset_session():
             if m:
                 full_tag, inner = m.group(1), m.group(2)
                 new_inner = re.sub(r'<session\s+value="[^"]*"', '<session value="0"', inner)
-                f.seek(0); f.write(content.replace(full_tag, f'<{SAVE_TAG}>{new_inner}</{SAVE_TAG}>', 1)); f.truncate()
+                if RESET_SESSION_ON_START:
+                    f.seek(0); f.write(content.replace(full_tag, f'<{SAVE_TAG}>{new_inner}</{SAVE_TAG}>', 1)); f.truncate()
             else: return True
     except: pass
     return True
@@ -204,7 +215,7 @@ class VoiceChat:
         self.pa = pyaudio.PyAudio()
         self.client = mqtt.Client(transport="websockets")
         self.client.on_connect = self.on_mqtt_connect
-        # self.client.on_message = self.on_mqtt_message
+        self.client.on_message = self.on_mqtt_message
         self.client.on_subscribe = self.on_mqtt_subscribe
         self.client.tls_set()
         try: self.mic_id = self.pa.get_default_input_device_info()['index']
@@ -217,9 +228,15 @@ class VoiceChat:
         self.peers = {}
         self.levels = {}
         self.audio_queues = {}
+        self.last_seen = {}
+        self.play_started = {}
         self.settings = {'hear_self': False, 'mic_gain': 1, 'master_vol': 1}
         self.client.connect(MQTT_BROKER, MQTT_PORT)
         self.client.loop_start()
+        self.last_pcm = {}
+        self.fade_remaining = {}
+        self.fade_total_samples = int(RATE * FADE_SECONDS)
+        self.faded_out = {}
 
     def on_mqtt_connect(self, client, userdata, flags, rc):
         print(f"[MQTT] Connected with code {rc}")
@@ -233,19 +250,39 @@ class VoiceChat:
             if "audio" in topic_parts:
                 uid = str(topic_parts[-1])
                 if uid == str(self.local["id"]): return
-                if uid not in self.audio_queues: self.audio_queues[uid] = bytearray()
+                if uid not in self.audio_queues:
+                    self.audio_queues[uid] = bytearray()
+                    self.play_started[uid] = False
                 self.audio_queues[uid].extend(m.payload)
-                if len(self.audio_queues[uid]) > (RATE * 2 * 3): 
-                    self.audio_queues[uid] = self.audio_queues[uid][-(RATE * 2):]
+                try:
+                    self.last_seen[uid] = time.time()
+                except: pass
+                try:
+                    self.fade_remaining[uid] = 0
+                    self.last_pcm.pop(uid, None)
+                    self.faded_out[uid] = False
+                except: pass
+                if len(self.audio_queues[uid]) > (RATE * 2 * MAX_QUEUE_SECONDS):
+                    self.audio_queues[uid] = self.audio_queues[uid][-(RATE * 2 * MAX_QUEUE_SECONDS):]
             elif "data" in topic_parts:
                 if not m.payload:
                     uid = str(topic_parts[-1])
                     if uid in self.peers: del self.peers[uid]
+                    try: del self.audio_queues[uid]
+                    except: pass
+                    try: del self.play_started[uid]
+                    except: pass
+                    try: del self.levels[uid]
+                    except: pass
+                    try: del self.last_seen[uid]
+                    except: pass
                     return
                 p = json.loads(m.payload)
                 uid = str(p["id"])
                 if uid == str(self.local["id"]): return
                 self.peers[uid] = p
+                try: self.last_seen[uid] = time.time()
+                except: pass
         except Exception as e: print(f"[MQTT ERR] {e}")
 
     def audio_thread(self):
@@ -287,7 +324,7 @@ class VoiceChat:
 
                     if not self.local["dead"]:
                         send_acc.extend(snd.tobytes())
-                        if len(send_acc) >= (RATE * 2):
+                        if len(send_acc) >= (RATE * 2 * AUDIO_SNIP_SECONDS):
                             self.client.publish(f"tdvc/{self.local['session']}/audio/{self.local['id']}", bytes(send_acc), qos=0)
                             send_acc = bytearray()
                     
@@ -295,17 +332,81 @@ class VoiceChat:
                     byte_size = CHUNK * 2
                     
                     for uid, q in list(self.audio_queues.items()):
-                        if len(q) < byte_size:
-                            self.levels[uid] = 0
-                            continue
                         try:
-                            chunk_bytes = q[:byte_size]
-                            del q[:byte_size]
-                            pcm = np.frombuffer(chunk_bytes, dtype=np.int16).astype(np.float32)
                             p_meta = self.peers.get(uid, {})
                             vl, vr = (1, 1) if p_meta.get("global") else self.spatial_calc(p_meta)
-                            self.levels[uid] = np.abs(pcm).mean() * ((vl + vr) / 2)
-                            mix[0::2] += pcm * vl; mix[1::2] += pcm * vr
+
+                            one_sec_bytes = RATE * 2
+
+                            if self.faded_out.get(uid, False) and len(q) == 0:
+                                self.levels[uid] = 0
+                                try: self.play_started[uid] = False
+                                except: pass
+                                continue
+
+                            if not self.play_started.get(uid, False):
+                                if len(q) >= one_sec_bytes:
+                                    self.play_started[uid] = True
+                                else:
+                                    self.levels[uid] = 0
+                                    continue
+
+                            if len(q) >= byte_size:
+                                chunk_bytes = q[:byte_size]
+                                del q[:byte_size]
+                                pcm = np.frombuffer(chunk_bytes, dtype=np.int16).astype(np.float32)
+                                self.last_pcm[uid] = pcm.copy()
+                                self.fade_remaining[uid] = 0
+                                self.faded_out[uid] = False
+                                self.levels[uid] = np.abs(pcm).mean() * ((vl + vr) / 2)
+                                mix[0::2] += pcm * vl; mix[1::2] += pcm * vr
+                                continue
+
+                            available_bytes = len(q)
+                            pcm_out = np.zeros(CHUNK, dtype=np.float32)
+                            part_len = 0
+                            if available_bytes > 0:
+                                chunk_bytes = q[:available_bytes]
+                                del q[:available_bytes]
+                                part = np.frombuffer(chunk_bytes, dtype=np.int16).astype(np.float32)
+                                part_len = len(part)
+                                pcm_out[:part_len] = part
+
+                            if self.fade_remaining.get(uid, 0) <= 0:
+                                if uid in self.last_pcm:
+                                    self.fade_remaining[uid] = self.fade_total_samples
+                                else:
+                                    self.levels[uid] = 0
+                                    continue
+
+                            rem = self.fade_remaining.get(uid, 0)
+                            if rem <= 0:
+                                self.levels[uid] = 0
+                                continue
+
+                            fade_needed = CHUNK - part_len
+                            fade_samples = min(rem, fade_needed)
+                            if fade_samples > 0 and uid in self.last_pcm:
+                                last = self.last_pcm[uid]
+                                lt = len(last)
+                                idxs = np.arange(fade_samples)
+                                multipliers = ((rem - idxs) / float(self.fade_total_samples)).astype(np.float32)
+                                if fade_samples <= lt:
+                                    source = last[-fade_samples:]
+                                else:
+                                    pad_len = fade_samples - lt
+                                    source = np.concatenate((last, np.full(pad_len, last[-1], dtype=last.dtype)))
+                                pcm_out[part_len:part_len+fade_samples] = source[:fade_samples] * multipliers
+
+                                new_rem = rem - fade_samples
+                                self.fade_remaining[uid] = new_rem
+                                if new_rem <= 0:
+                                    self.faded_out[uid] = True
+                                    try: del self.last_pcm[uid]
+                                    except: pass
+
+                            self.levels[uid] = np.abs(pcm_out).mean() * ((vl + vr) / 2)
+                            mix[0::2] += pcm_out * vl; mix[1::2] += pcm_out * vr
                         except: continue
                     
                     if self.settings['hear_self'] and not self.local["dead"]:
@@ -329,8 +430,10 @@ class VoiceChat:
 
     def spatial_calc(self, p):
         if not p: return 0.5, 0.5
-        dx, dz = p.get("x", 0) - self.local["x"], p.get("z", 0) - self.local["z"]
-        dist = math.sqrt(dx*dx + dz*dz)
+        dx = p.get("x", 0) - self.local["x"]
+        dy = p.get("y", 0) - self.local["y"]
+        dz = p.get("z", 0) - self.local["z"]
+        dist = math.sqrt(dx*dx + dy*dy + dz*dz)
         vol = max(0, 1 - (dist / 45))
         pan = np.clip(dx / -15, -0.8, 0.8)
         return vol * (1 - pan), vol * (1 + pan)
@@ -358,6 +461,7 @@ class VoiceChat:
                             self.client.subscribe(f"tdvc/{cs}/#")
                             self.peers.clear()
                             self.audio_queues.clear()
+                            self.play_started.clear()
                         
                         ls = cs
                         self.restart_trigger = True
@@ -373,9 +477,24 @@ class VoiceChat:
                         "show_map": g("showmap", 0), 
                         "echo": g("echo", 0)
                     })
-                    
+
                     if cs > 0 and self.local["id"] != 0:
                          self.client.publish(f"tdvc/{cs}/data/{self.local['id']}", json.dumps(self.local), qos=0, retain=True)
+                    try:
+                        now = time.time()
+                        stale = [uid for uid, ts in self.last_seen.items() if now - ts > STALE_TIMEOUT]
+                        for uid in stale:
+                            try: del self.peers[uid]
+                            except: pass
+                            try: del self.audio_queues[uid]
+                            except: pass
+                            try: del self.play_started[uid]
+                            except: pass
+                            try: del self.levels[uid]
+                            except: pass
+                            try: del self.last_seen[uid]
+                            except: pass
+                    except: pass
                 except Exception as e:
                      print(f"[MONITOR ERR] {e}")
             time.sleep(0.3)
@@ -423,9 +542,9 @@ def gui_updater(vc, win):
     while vc.running:
         try:
             plist = []
-            plist.append({"id": vc.local["id"], "name": vc.local["name"], "vol": min(100, int(vc.levels.get(str(vc.local["id"]), 0)/10)), "status": "DEAD" if vc.local["dead"] else "LIVE", "local": True, "x": vc.local["x"], "z": vc.local["z"], "echo": vc.local["echo"]})
+            plist.append({"id": vc.local["id"], "name": vc.local["name"], "vol": min(100, int(vc.levels.get(str(vc.local["id"]), 0)/10)), "status": "DEAD" if vc.local["dead"] else "LIVE", "local": True, "x": vc.local["x"], "y": vc.local["y"], "z": vc.local["z"], "echo": vc.local["echo"]})
             for uid, p in vc.peers.items():
-                plist.append({"id": uid, "name": p.get("name", "Player"), "vol": min(100, int(vc.levels.get(uid, 0)/10)), "status": "DEAD" if p.get("dead") else "LIVE", "local": False, "x": p.get("x", 0), "z": p.get("z", 0), "echo": p.get("echo", 0)})
+                plist.append({"id": uid, "name": p.get("name", "Player"), "vol": min(100, int(vc.levels.get(uid, 0)/10)), "status": "DEAD" if p.get("dead") else "LIVE", "local": False, "x": p.get("x", 0), "y": p.get("y", 0), "z": p.get("z", 0), "echo": p.get("echo", 0)})
             win.evaluate_js(f"render('{json.dumps({'session': vc.local['session'], 'players': plist, 'show_map': vc.local['show_map']})}')")
         except: pass
         time.sleep(0.1)
