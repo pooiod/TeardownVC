@@ -3,16 +3,19 @@
 local VERSION = 2
 local cache = {}
 
-local notif_duration = 5.0
-local notif_timer = 0.0
+local notif_duration = 5
+local notif_timer = 0
 local notif_active = true
-local notif_anim = 0.0 
+local notif_anim = 0 
 
 local window_open = false
-local window_anim = 0.0
+local window_anim = 0
 
 local global_enabled = false
-local myId = 0 
+
+local my_server_id = 0
+local my_temp_key = 0
+local next_player_id = 1
 
 local NOTIF_WIDTH = 600
 local NOTIF_HEIGHT = 50
@@ -27,44 +30,50 @@ end
 
 function server.init()
     math.randomseed(os.time())
+    shared.id_requests = {}
+    shared.id_responses = {}
     shared.user_map = {}
-    shared.client_ids_pending = {}
     shared.ShowPlayerMap = 0
     shared.session_id = math.random(1000, 9999)
 end
 
 function server.update(dt)
-    if not shared.client_ids_pending then return end
-
-    local map_changed = false
-    for key, id in pairs(shared.client_ids_pending) do
-        if id and id > 0 and not shared.user_map[key] then
-            shared.user_map[key] = id
-            map_changed = true
-        end
+    if not shared.session_id then
+        shared.session_id = math.random(1000, 9999)
     end
-    if map_changed then
-        shared.user_map = shared.user_map 
+
+    if shared.id_requests and #shared.id_requests > 0 then
+        for i, request in ipairs(shared.id_requests) do
+            if not shared.id_responses[request.temp_key] then
+                local assigned_id = next_player_id
+                shared.id_responses[request.temp_key] = assigned_id
+                shared.user_map[assigned_id] = {name = request.name}
+                next_player_id = next_player_id + 1
+            end
+        end
+        shared.id_requests = {}
     end
 end
 
 function client.tick(dt)
-    if myId == 0 then
-        myId = math.random(100, 999)
-    end
-
     if Network and Network.IsConnected() then
-        if not shared.client_ids_pending then shared.client_ids_pending = {} end
-        local myName = GetUserNickname()
-        local uniqueKey = myName .. "_" .. tostring(GetPlayer())
-        if not shared.client_ids_pending[uniqueKey] then
-            shared.client_ids_pending[uniqueKey] = myId
+        if my_server_id == 0 then
+            if my_temp_key == 0 then
+                my_temp_key = math.random(1000000, 9999999)
+                if not shared.id_requests then shared.id_requests = {} end
+                
+                table.insert(shared.id_requests, {temp_key = my_temp_key, name = GetUserNickname()})
+            end
+
+            if shared.id_responses and shared.id_responses[my_temp_key] then
+                my_server_id = shared.id_responses[my_temp_key]
+            end
         end
     end
 
     updateInt("version", VERSION)
-    updateInt("session", shared.session_id or 0)
-    updateInt("userid", myId)
+    updateInt("session", shared.session_id, true)
+    updateInt("userid", my_server_id)
 
     local pos = GetPlayerPos()
     updateInt("pos_x", math.floor(pos[1] * 100))
@@ -87,7 +96,7 @@ function client.tick(dt)
         if notif_timer > notif_duration then
             notif_active = false
         end
-        if InputPressed("return") then
+        if InputPressed("return") or InputPressed("enter") then
             window_open = true
             notif_active = false
         end
@@ -105,12 +114,12 @@ function drawRoundedRect(w, h, r, g, b, a)
 end
 
 function client.draw(dt)
-    local anim_speed = 5.0
+    local anim_speed = 5
 
-    local notif_target = (notif_active and not window_open) and 1.0 or 0.0
+    local notif_target = (notif_active and not window_open) and 1 or 0
     notif_anim = notif_anim + (notif_target - notif_anim) * dt * anim_speed
 
-    local window_target = window_open and 1.0 or 0.0
+    local window_target = window_open and 1 or 0
     window_anim = window_anim + (window_target - window_anim) * dt * anim_speed
 
     if notif_anim > 0.01 then

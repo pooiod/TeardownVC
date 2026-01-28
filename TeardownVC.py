@@ -11,6 +11,7 @@ import paho.mqtt.client as mqtt
 import webview
 import math
 import sys
+import random
 
 try:
     import psutil
@@ -26,11 +27,11 @@ CHUNK = 512
 FORMAT = pyaudio.paInt16
 CHANNELS = 1
 RATE = 8000
-AUDIO_SNIP_SECONDS = 1
+AUDIO_SNIP_SECONDS = 0.5
 MAX_QUEUE_SECONDS = 4
 STALE_TIMEOUT = 10
 FADE_SECONDS = 1
-RESET_SESSION_ON_START = True
+RESET_SESSION_ON_START = False
 
 HTML = """
 <!DOCTYPE html>
@@ -213,7 +214,8 @@ def force_reset_session():
 class VoiceChat:
     def __init__(self):
         self.pa = pyaudio.PyAudio()
-        self.client = mqtt.Client(transport="websockets")
+        client_id = f"tdvc-{random.randint(10000, 99999)}-{int(time.time())}"
+        self.client = mqtt.Client(client_id=client_id, transport="websockets")
         self.client.on_connect = self.on_mqtt_connect
         self.client.on_message = self.on_mqtt_message
         self.client.on_subscribe = self.on_mqtt_subscribe
@@ -478,7 +480,7 @@ class VoiceChat:
                         "echo": g("echo", 0)
                     })
 
-                    if cs > 0 and self.local["id"] != 0:
+                    if cs > 0:
                          self.client.publish(f"tdvc/{cs}/data/{self.local['id']}", json.dumps(self.local), qos=0, retain=True)
                     try:
                         now = time.time()
@@ -559,4 +561,3 @@ if __name__ == "__main__":
         webview.start()
         if v.local["session"] > 0: v.client.publish(f"tdvc/{v.local['session']}/data/{v.local['id']}", payload=None, retain=True)
         v.running = False
-
