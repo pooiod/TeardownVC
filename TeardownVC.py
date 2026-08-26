@@ -8,6 +8,7 @@ import webbrowser
 import math
 import sys
 import wave
+import zlib
 import numpy as np
 import sounddevice as sd
 import paho.mqtt.client as mqtt
@@ -22,14 +23,14 @@ TEST_MODE = False
 TEST_MP3_PATH = "test.mp3"
 TEST_DATA = {
     "session": "game",
-    "userid": 9284,
-    "name": "TestingClient",
-    "pos_x": 0.0,
-    "pos_y": 0.0,
-    "pos_z": 0.0,
-    "isdead": 0,
-    "global": 1,
-    "showmap": 0,
+    "userid": "game",
+    "name": "game",
+    "pos_x": "game",
+    "pos_y": "game",
+    "pos_z": "game",
+    "isdead": "game",
+    "global": "game",
+    "showmap": "game",
     "echo": "game"
 }
 
@@ -213,6 +214,12 @@ def get_steam_username():
     except Exception:
         return "Player"
 
+def get_unique_userid():
+    name = get_steam_username()
+    comp = os.environ.get('COMPUTERNAME', os.environ.get('HOSTNAME', 'TDPlayer'))
+    raw = f"{name}_{comp}"
+    return (zlib.crc32(raw.encode('utf-8')) % 899999) + 100000
+
 def get_game_xml_dict():
     res = {}
     if os.path.exists(SAVE_PATH):
@@ -350,6 +357,8 @@ def load_audio_file(file_path, target_rate):
 class VoiceChat:
     def __init__(self):
         self.audio_lock = threading.Lock()
+        self.fallback_userid = get_unique_userid()
+
         try:
             self.client = mqtt.Client(mqtt.CallbackAPIVersion.VERSION2, transport="websockets")
         except (AttributeError, TypeError):
@@ -376,7 +385,8 @@ class VoiceChat:
             initial_name = get_steam_username() if str(raw_name).lower() == "game" else str(raw_name)
 
             raw_id = TEST_DATA.get("userid", 0)
-            initial_id = int(game_dict.get("userid", 0)) if str(raw_id).lower() == "game" else int(raw_id)
+            parsed_id = int(game_dict.get("userid", 0)) if str(raw_id).lower() == "game" else int(raw_id)
+            initial_id = parsed_id if parsed_id > 0 else self.fallback_userid
 
             raw_session = TEST_DATA.get("session", 0)
             initial_session = int(game_dict.get("session", 0)) if str(raw_session).lower() == "game" else int(raw_session)
@@ -385,9 +395,10 @@ class VoiceChat:
             initial_dead = int(game_dict.get("isdead", 1)) if str(raw_dead).lower() == "game" else int(raw_dead)
         else:
             initial_name = get_steam_username()
-            initial_id = 0
-            initial_session = 0
-            initial_dead = 1
+            parsed_id = int(game_dict.get("userid", 0))
+            initial_id = parsed_id if parsed_id > 0 else self.fallback_userid
+            initial_session = int(game_dict.get("session", 0))
+            initial_dead = int(game_dict.get("isdead", 1))
         
         self.local = {
             "id": initial_id,
@@ -670,7 +681,7 @@ class VoiceChat:
                 self.last_audio_time[uid] = now
 
                 if peer_rate <= 0:
-                    standard_rates = [8000, 11025, 12000, 16000, 22050, 24000, 32000, 44100, 48000, 96000]
+                    standard_rates = [8000, 11025, 12000, 16000, 22050, 24000, 32000, 40000, 44100, 48000, 96000]
                     if 0.4 <= dt <= 2.5:
                         est_rate = int(round(len(raw_samples) / dt))
                         peer_rate = min(standard_rates, key=lambda r: abs(r - est_rate))
@@ -739,7 +750,8 @@ class VoiceChat:
                 cs = int(game_dict.get("session", 0)) if str(raw_session).lower() == "game" else int(raw_session)
 
                 raw_id = TEST_DATA.get("userid", 0)
-                current_userid = int(game_dict.get("userid", 0)) if str(raw_id).lower() == "game" else int(raw_id)
+                parsed_id = int(game_dict.get("userid", 0)) if str(raw_id).lower() == "game" else int(raw_id)
+                current_userid = parsed_id if parsed_id > 0 else self.fallback_userid
 
                 raw_name = TEST_DATA.get("name", "Tester")
                 current_name = get_steam_username() if str(raw_name).lower() == "game" else str(raw_name)
@@ -821,7 +833,8 @@ class VoiceChat:
                                 return default
 
                         cs = int(g("session", 0))
-                        current_userid = int(g("userid", 0))
+                        parsed_id = int(g("userid", 0))
+                        current_userid = parsed_id if parsed_id > 0 else self.fallback_userid
 
                         if cs != ls:
                             if ls > 0 and self.local["id"] != 0:
@@ -843,6 +856,7 @@ class VoiceChat:
 
                         self.local.update({
                             "id": current_userid, 
+                            "name": get_steam_username(),
                             "x": float(g("pos_x", 0)) / 100.0, 
                             "y": float(g("pos_y", 0)) / 100.0, 
                             "z": float(g("pos_z", 0)) / 100.0, 
