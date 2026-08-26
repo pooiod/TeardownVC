@@ -21,24 +21,24 @@ except ImportError:
 TEST_MODE = False
 TEST_MP3_PATH = "test.mp3"
 TEST_DATA = {
-    "session": 6432,
-    "userid": 1234,
-    "name": "Tester",
+    "session": "game",
+    "userid": 9284,
+    "name": "TestingClient",
     "pos_x": 0.0,
     "pos_y": 0.0,
     "pos_z": 0.0,
     "isdead": 0,
-    "global": 0,
-    "showmap": 0, # debug, do not use
-    "echo": 0
+    "global": 1,
+    "showmap": 0,
+    "echo": "game"
 }
 
 SAVE_TAG = "steam-3653434619"
-CLIENT_VERSION = 2
+CLIENT_VERSION = 3
 SAVE_PATH = os.path.expandvars(r'%LOCALAPPDATA%\Teardown\savegame.xml')
 MQTT_BROKER = "broker.emqx.io"
 MQTT_PORT = 8084
-RATE = 8000
+RATE = 40000
 AUDIO_SNIP_SECONDS = 1
 MAX_QUEUE_SECONDS = 4
 STALE_TIMEOUT = 10
@@ -213,6 +213,25 @@ def get_steam_username():
     except Exception:
         return "Player"
 
+def get_game_xml_dict():
+    res = {}
+    if os.path.exists(SAVE_PATH):
+        try:
+            with open(SAVE_PATH, 'r', encoding='utf-8', errors='ignore') as f:
+                xml = f.read()
+            m = re.search(fr'<{SAVE_TAG}>(.*?)</{SAVE_TAG}>', xml, re.S)
+            if m:
+                inner = m.group(1)
+                for tag, val in re.findall(r'<([a-zA-Z0-9_]+)\s+value="([^"]*)"', inner):
+                    val_str = val.strip()
+                    try:
+                        res[tag] = float(val_str) if '.' in val_str else int(val_str)
+                    except (ValueError, TypeError):
+                        res[tag] = val_str
+        except Exception:
+            pass
+    return res
+
 def force_reset_session():
     if not os.path.exists(SAVE_PATH):
         return True
@@ -351,15 +370,30 @@ class VoiceChat:
 
         self.running = True
         
-        initial_name = TEST_DATA.get("name", "Tester") if TEST_MODE else get_steam_username()
-        initial_id = int(TEST_DATA.get("userid", 0)) if TEST_MODE else 0
-        initial_session = int(TEST_DATA.get("session", 0)) if TEST_MODE else 0
+        game_dict = get_game_xml_dict()
+        if TEST_MODE:
+            raw_name = TEST_DATA.get("name", "Tester")
+            initial_name = get_steam_username() if str(raw_name).lower() == "game" else str(raw_name)
+
+            raw_id = TEST_DATA.get("userid", 0)
+            initial_id = int(game_dict.get("userid", 0)) if str(raw_id).lower() == "game" else int(raw_id)
+
+            raw_session = TEST_DATA.get("session", 0)
+            initial_session = int(game_dict.get("session", 0)) if str(raw_session).lower() == "game" else int(raw_session)
+
+            raw_dead = TEST_DATA.get("isdead", 0)
+            initial_dead = int(game_dict.get("isdead", 1)) if str(raw_dead).lower() == "game" else int(raw_dead)
+        else:
+            initial_name = get_steam_username()
+            initial_id = 0
+            initial_session = 0
+            initial_dead = 1
         
         self.local = {
             "id": initial_id,
             "name": initial_name,
             "x": 0.0, "y": 0.0, "z": 0.0,
-            "dead": 0 if TEST_MODE else 1,
+            "dead": initial_dead,
             "session": initial_session,
             "show_map": 0, "echo": 0, "global": 0,
             "rate": RATE
@@ -699,10 +733,38 @@ class VoiceChat:
 
         while self.running:
             if TEST_MODE:
-                cs = int(TEST_DATA.get("session", 0))
-                current_userid = int(TEST_DATA.get("userid", 0))
-                current_name = str(TEST_DATA.get("name", "Tester"))
-                
+                game_dict = get_game_xml_dict()
+
+                raw_session = TEST_DATA.get("session", 0)
+                cs = int(game_dict.get("session", 0)) if str(raw_session).lower() == "game" else int(raw_session)
+
+                raw_id = TEST_DATA.get("userid", 0)
+                current_userid = int(game_dict.get("userid", 0)) if str(raw_id).lower() == "game" else int(raw_id)
+
+                raw_name = TEST_DATA.get("name", "Tester")
+                current_name = get_steam_username() if str(raw_name).lower() == "game" else str(raw_name)
+
+                raw_x = TEST_DATA.get("pos_x", 0.0)
+                cur_x = (float(game_dict.get("pos_x", 0.0)) / 100.0) if str(raw_x).lower() == "game" else float(raw_x)
+
+                raw_y = TEST_DATA.get("pos_y", 0.0)
+                cur_y = (float(game_dict.get("pos_y", 0.0)) / 100.0) if str(raw_y).lower() == "game" else float(raw_y)
+
+                raw_z = TEST_DATA.get("pos_z", 0.0)
+                cur_z = (float(game_dict.get("pos_z", 0.0)) / 100.0) if str(raw_z).lower() == "game" else float(raw_z)
+
+                raw_dead = TEST_DATA.get("isdead", 0)
+                cur_dead = int(game_dict.get("isdead", 1)) if str(raw_dead).lower() == "game" else int(raw_dead)
+
+                raw_global = TEST_DATA.get("global", 0)
+                cur_global = int(game_dict.get("global", 0)) if str(raw_global).lower() == "game" else int(raw_global)
+
+                raw_map = TEST_DATA.get("showmap", TEST_DATA.get("show_map", 0))
+                cur_map = int(game_dict.get("showmap", 0)) if str(raw_map).lower() == "game" else int(raw_map)
+
+                raw_echo = TEST_DATA.get("echo", 0)
+                cur_echo = int(game_dict.get("echo", 0)) if str(raw_echo).lower() == "game" else int(raw_echo)
+
                 if cs != ls:
                     if ls > 0 and self.local["id"] != 0:
                         self.client.publish(f"tdvc/{ls}/data/{self.local['id']}", payload=b"", retain=True)
@@ -722,14 +784,14 @@ class VoiceChat:
                 self.local.update({
                     "id": current_userid,
                     "name": current_name,
-                    "x": float(TEST_DATA.get("pos_x", 0.0)),
-                    "y": float(TEST_DATA.get("pos_y", 0.0)),
-                    "z": float(TEST_DATA.get("pos_z", 0.0)),
-                    "dead": int(TEST_DATA.get("isdead", 0)),
+                    "x": cur_x,
+                    "y": cur_y,
+                    "z": cur_z,
+                    "dead": cur_dead,
                     "session": cs,
-                    "global": int(TEST_DATA.get("global", 0)),
-                    "show_map": int(TEST_DATA.get("showmap", 0)),
-                    "echo": int(TEST_DATA.get("echo", 0)),
+                    "global": cur_global,
+                    "show_map": cur_map,
+                    "echo": cur_echo,
                     "rate": RATE
                 })
 
