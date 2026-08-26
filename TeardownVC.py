@@ -5,32 +5,44 @@ import time
 import threading
 import subprocess
 import webbrowser
-import numpy as np
-import pyaudio
-import paho.mqtt.client as mqtt
-import webview
 import math
 import sys
-import random
+import wave
+import numpy as np
+import sounddevice as sd
+import paho.mqtt.client as mqtt
+import webview
 
 try:
     import psutil
-except:
+except ImportError:
     psutil = None
+
+TEST_MODE = False
+TEST_MP3_PATH = "test.mp3"
+TEST_DATA = {
+    "session": 6432,
+    "userid": 1234,
+    "name": "Tester",
+    "pos_x": 0.0,
+    "pos_y": 0.0,
+    "pos_z": 0.0,
+    "isdead": 0,
+    "global": 0,
+    "showmap": 0, # debug, do not use
+    "echo": 0
+}
 
 SAVE_TAG = "steam-3653434619"
 CLIENT_VERSION = 2
 SAVE_PATH = os.path.expandvars(r'%LOCALAPPDATA%\Teardown\savegame.xml')
 MQTT_BROKER = "broker.emqx.io"
 MQTT_PORT = 8084
-CHUNK = 512
-FORMAT = pyaudio.paInt16
-CHANNELS = 1
 RATE = 8000
-AUDIO_SNIP_SECONDS = 0.5
+AUDIO_SNIP_SECONDS = 1
 MAX_QUEUE_SECONDS = 4
 STALE_TIMEOUT = 10
-FADE_SECONDS = 1
+FADE_SAMPLES = int(RATE * 0.75)
 RESET_SESSION_ON_START = False
 
 HTML = """
@@ -189,15 +201,21 @@ def get_steam_username():
         key = winreg.OpenKey(winreg.HKEY_CURRENT_USER, r"Software\Valve\Steam")
         steam_path = winreg.QueryValueEx(key, "SteamPath")[0]
         login_vdf = os.path.join(steam_path, "config", "loginusers.vdf")
-        with open(login_vdf, 'r', encoding='utf-8') as f: content = f.read()
+        with open(login_vdf, 'r', encoding='utf-8') as f:
+            content = f.read()
         users = re.findall(r'"PersonaName"\s+"([^"]+)"', content)
-        if users: return users[-1]
-    except: pass
-    try: return os.getlogin()
-    except: return "Player"
+        if users:
+            return users[-1]
+    except Exception:
+        pass
+    try:
+        return os.getlogin()
+    except Exception:
+        return "Player"
 
 def force_reset_session():
-    if not os.path.exists(SAVE_PATH): return False
+    if not os.path.exists(SAVE_PATH):
+        return True
     try:
         with open(SAVE_PATH, 'r+', encoding='utf-8') as f:
             content = f.read()
@@ -206,44 +224,396 @@ def force_reset_session():
                 full_tag, inner = m.group(1), m.group(2)
                 new_inner = re.sub(r'<session\s+value="[^"]*"', '<session value="0"', inner)
                 if RESET_SESSION_ON_START:
-                    f.seek(0); f.write(content.replace(full_tag, f'<{SAVE_TAG}>{new_inner}</{SAVE_TAG}>', 1)); f.truncate()
-            else: return True
-    except: pass
+                    f.seek(0)
+                    f.write(content.replace(full_tag, f'<{SAVE_TAG}>{new_inner}</{SAVE_TAG}>', 1))
+                    f.truncate()
+            else:
+                return True
+    except Exception:
+        pass
     return True
+
+def resample_audio(samples, from_rate, to_rate):
+    if from_rate == to_rate or len(samples) == 0:
+        return samples
+    num_output = int(round(len(samples) * float(to_rate) / float(from_rate)))
+    if num_output == 0:
+        return np.zeros(0, dtype=samples.dtype)
+    x_old = np.linspace(0, 1, len(samples), endpoint=False)
+    x_new = np.linspace(0, 1, num_output, endpoint=False)
+    return np.interp(x_new, x_old, samples).astype(samples.dtype)
+
+def soft_clip(samples, gain=1.0):
+    samples_f = samples.astype(np.float32) * (gain / 32768.0)
+    return (np.tanh(samples_f) * 32767.0).astype(np.int16)
+
+def load_audio_file(file_path, target_rate):
+    script_dir = os.path.dirname(os.path.abspath(__file__))
+    candidates = [
+        os.path.join(script_dir, file_path),
+        os.path.join(script_dir, "test.wav"),
+        os.path.abspath(file_path),
+        os.path.abspath("test.wav")
+    ]
+    resolved_path = None
+    for p in candidates:
+        if os.path.isfile(p):
+            resolved_path = p
+            break
+    if not resolved_path:
+        t = np.linspace(0, 1, target_rate, False)
+        return (np.sin(2 * np.pi * 440 * t) * 10000).astype(np.int16)
+
+    ext = os.path.splitext(resolved_path)[1].lower()
+    if ext == ".wav":
+        try:
+            with wave.open(resolved_path, 'rb') as wf:
+                sr = wf.getframerate()
+                n_ch = wf.getnchannels()
+                sw = wf.getsampwidth()
+                frames = wf.readframes(wf.getnframes())
+                if sw == 2:
+                    raw = np.frombuffer(frames, dtype=np.int16)
+                elif sw == 1:
+                    raw = ((np.frombuffer(frames, dtype=np.uint8).astype(np.int32) - 128) * 256).astype(np.int16)
+                else:
+                    raw = np.frombuffer(frames, dtype=np.int32) >> 16
+                if n_ch > 1:
+                    raw = raw.reshape(-1, n_ch).mean(axis=1).astype(np.int16)
+                return resample_audio(raw, sr, target_rate)
+        except Exception:
+            pass
+
+    try:
+        import soundfile as sf
+        data, sr = sf.read(resolved_path, dtype='float32')
+        if data.ndim > 1:
+            data = data.mean(axis=1)
+        data = resample_audio(data, sr, target_rate)
+        return (data * 32767.0).clip(-32768, 32767).astype(np.int16)
+    except Exception:
+        pass
+
+    try:
+        import miniaudio
+        decoded = miniaudio.decode_file(resolved_path, output_format=miniaudio.SampleFormat.SIGNED16, nchannels=1, sample_rate=target_rate)
+        return np.frombuffer(decoded.samples, dtype=np.int16)
+    except Exception:
+        pass
+
+    try:
+        import imageio_ffmpeg
+        ffmpeg_bin = imageio_ffmpeg.get_ffmpeg_exe()
+        cmd = [ffmpeg_bin, '-i', resolved_path, '-f', 's16le', '-acodec', 'pcm_s16le', '-ar', str(target_rate), '-ac', '1', '-']
+        proc = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, check=True)
+        return np.frombuffer(proc.stdout, dtype=np.int16)
+    except Exception:
+        pass
+
+    try:
+        cmd = ['ffmpeg', '-i', resolved_path, '-f', 's16le', '-acodec', 'pcm_s16le', '-ar', str(target_rate), '-ac', '1', '-']
+        proc = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, check=True)
+        return np.frombuffer(proc.stdout, dtype=np.int16)
+    except Exception:
+        pass
+
+    try:
+        from pydub import AudioSegment
+        audio = AudioSegment.from_file(resolved_path)
+        audio = audio.set_frame_rate(target_rate).set_channels(1).set_sample_width(2)
+        return np.array(audio.get_array_of_samples(), dtype=np.int16)
+    except Exception:
+        pass
+
+    t = np.linspace(0, 1, target_rate, False)
+    return (np.sin(2 * np.pi * 440 * t) * 10000).astype(np.int16)
 
 class VoiceChat:
     def __init__(self):
-        self.pa = pyaudio.PyAudio()
-        client_id = f"tdvc-{random.randint(10000, 99999)}-{int(time.time())}"
-        self.client = mqtt.Client(client_id=client_id, transport="websockets")
+        self.audio_lock = threading.Lock()
+        try:
+            self.client = mqtt.Client(mqtt.CallbackAPIVersion.VERSION2, transport="websockets")
+        except (AttributeError, TypeError):
+            self.client = mqtt.Client(transport="websockets")
+
         self.client.on_connect = self.on_mqtt_connect
         self.client.on_message = self.on_mqtt_message
         self.client.on_subscribe = self.on_mqtt_subscribe
         self.client.tls_set()
-        try: self.mic_id = self.pa.get_default_input_device_info()['index']
-        except: self.mic_id = 0
-        try: self.spk_id = self.pa.get_default_output_device_info()['index']
-        except: self.spk_id = 0
-        self.restart_trigger = False
+
+        try:
+            default_dev = sd.default.device
+            self.mic_id = default_dev[0] if default_dev[0] is not None and default_dev[0] >= 0 else None
+            self.spk_id = default_dev[1] if default_dev[1] is not None and default_dev[1] >= 0 else None
+        except Exception:
+            self.mic_id = None
+            self.spk_id = None
+
         self.running = True
-        self.local = {"id": 0, "name": get_steam_username(), "x": 0, "y": 0, "z": 0, "dead": 1, "session": 0, "show_map": 0, "echo": 0, "global": 0}
+        
+        initial_name = TEST_DATA.get("name", "Tester") if TEST_MODE else get_steam_username()
+        initial_id = int(TEST_DATA.get("userid", 0)) if TEST_MODE else 0
+        initial_session = int(TEST_DATA.get("session", 0)) if TEST_MODE else 0
+        
+        self.local = {
+            "id": initial_id,
+            "name": initial_name,
+            "x": 0.0, "y": 0.0, "z": 0.0,
+            "dead": 0 if TEST_MODE else 1,
+            "session": initial_session,
+            "show_map": 0, "echo": 0, "global": 0,
+            "rate": RATE
+        }
         self.peers = {}
         self.levels = {}
         self.audio_queues = {}
         self.last_seen = {}
-        self.play_started = {}
-        self.settings = {'hear_self': False, 'mic_gain': 1, 'master_vol': 1}
+        self.last_pcm = {}
+        self.fade_pos = {}
+        self.last_audio_time = {}
+        self.settings = {'hear_self': False, 'mic_gain': 1.0, 'master_vol': 1.0}
+        
+        self.echo_buffer = np.zeros(RATE * 4, dtype=np.float32)
+        self.echo_pos = 0
+        self.self_hear_buf = bytearray()
+        self.send_acc = bytearray()
+
+        self.in_stream = None
+        self.out_stream = None
+        self.mic_rate = 48000
+        self.spk_rate = 48000
+        self.test_audio_samples = np.zeros(0, dtype=np.int16)
+        self.test_audio_idx = 0
+
+        self.start_audio_streams()
+
         self.client.connect(MQTT_BROKER, MQTT_PORT)
         self.client.loop_start()
-        self.last_pcm = {}
-        self.fade_remaining = {}
-        self.fade_total_samples = int(RATE * FADE_SECONDS)
-        self.faded_out = {}
 
-    def on_mqtt_connect(self, client, userdata, flags, rc):
-        print(f"[MQTT] Connected with code {rc}")
+    def start_audio_streams(self):
+        self.stop_audio_streams()
+        try:
+            devices = sd.query_devices()
+            if self.mic_id is not None and self.mic_id < len(devices):
+                self.mic_rate = int(devices[self.mic_id].get('default_samplerate', 48000))
+            else:
+                self.mic_rate = 48000
 
-    def on_mqtt_subscribe(self, client, userdata, mid, granted_qos):
+            if self.spk_id is not None and self.spk_id < len(devices):
+                self.spk_rate = int(devices[self.spk_id].get('default_samplerate', 48000))
+            else:
+                self.spk_rate = 48000
+        except Exception:
+            self.mic_rate = 48000
+            self.spk_rate = 48000
+
+        if TEST_MODE:
+            self.test_audio_samples = load_audio_file(TEST_MP3_PATH, self.mic_rate)
+            self.test_audio_idx = 0
+
+        try:
+            self.in_stream = sd.InputStream(
+                device=self.mic_id,
+                channels=1,
+                samplerate=self.mic_rate,
+                dtype='int16',
+                blocksize=512,
+                callback=self.mic_callback
+            )
+            self.in_stream.start()
+        except Exception as e:
+            print(f"[AUDIO] Mic Stream Error: {e}")
+
+        try:
+            self.out_stream = sd.OutputStream(
+                device=self.spk_id,
+                channels=2,
+                samplerate=self.spk_rate,
+                dtype='int16',
+                blocksize=512,
+                callback=self.spk_callback
+            )
+            self.out_stream.start()
+        except Exception as e:
+            print(f"[AUDIO] Spk Stream Error: {e}")
+
+    def stop_audio_streams(self):
+        if self.in_stream is not None:
+            try:
+                self.in_stream.stop()
+                self.in_stream.close()
+            except Exception:
+                pass
+            self.in_stream = None
+
+        if self.out_stream is not None:
+            try:
+                self.out_stream.stop()
+                self.out_stream.close()
+            except Exception:
+                pass
+            self.out_stream = None
+
+    def set_io(self, mic_id, spk_id):
+        self.mic_id = mic_id
+        self.spk_id = spk_id
+        self.start_audio_streams()
+
+    def mic_callback(self, indata, frames, time_info, status):
+        try:
+            if TEST_MODE and len(self.test_audio_samples) > 0:
+                end = self.test_audio_idx + frames
+                if end <= len(self.test_audio_samples):
+                    raw_hw = self.test_audio_samples[self.test_audio_idx:end]
+                    self.test_audio_idx = end
+                else:
+                    part1 = self.test_audio_samples[self.test_audio_idx:]
+                    part2 = self.test_audio_samples[: max(0, frames - len(part1))]
+                    if len(part1) + len(part2) < frames:
+                        pad = np.zeros(frames - (len(part1) + len(part2)), dtype=np.int16)
+                        raw_hw = np.concatenate((part1, part2, pad))
+                    else:
+                        raw_hw = np.concatenate((part1, part2))
+                    self.test_audio_idx = len(part2)
+            else:
+                raw_hw = indata[:, 0]
+
+            raw_8k = resample_audio(raw_hw, self.mic_rate, RATE)
+            gain = self.settings.get('mic_gain', 1.0)
+            in_proc = raw_8k.astype(np.float32) * gain
+
+            cur_echo = max(0, int(self.local.get("echo", 0)))
+            if cur_echo > 0:
+                delay_samples = max(1, int(RATE * (cur_echo / 1000.0)))
+                n_samples = len(in_proc)
+                read_idx = (self.echo_pos - delay_samples + np.arange(n_samples)) % len(self.echo_buffer)
+                delayed = self.echo_buffer[read_idx]
+                snd_f = in_proc + (delayed * 0.48)
+                write_idx = (self.echo_pos + np.arange(n_samples)) % len(self.echo_buffer)
+                self.echo_buffer[write_idx] = snd_f
+                self.echo_pos = (self.echo_pos + n_samples) % len(self.echo_buffer)
+            else:
+                snd_f = in_proc
+                self.echo_buffer.fill(0)
+
+            snd_8k = soft_clip(snd_f, 1.0)
+
+            level = float(np.abs(snd_8k).mean()) if len(snd_8k) > 0 else 0.0
+            self.levels[str(self.local["id"])] = level
+
+            if self.settings.get('hear_self', False) and not self.local["dead"]:
+                with self.audio_lock:
+                    self.self_hear_buf.extend(snd_8k.tobytes())
+                    if len(self.self_hear_buf) > RATE * 2:
+                        self.self_hear_buf = self.self_hear_buf[-(RATE * 2):]
+
+            if not self.local["dead"] and self.local["session"] > 0 and self.local["id"] != 0:
+                with self.audio_lock:
+                    self.send_acc.extend(snd_8k.tobytes())
+                    snip_bytes = RATE * 2 * AUDIO_SNIP_SECONDS
+                    if len(self.send_acc) >= snip_bytes:
+                        payload = bytes(self.send_acc[:snip_bytes])
+                        del self.send_acc[:snip_bytes]
+                        self.client.publish(f"tdvc/{self.local['session']}/audio/{self.local['id']}", payload, qos=0)
+        except Exception:
+            pass
+
+    def spk_callback(self, outdata, frames, time_info, status):
+        try:
+            needed_8k = int(math.ceil(frames * RATE / self.spk_rate))
+            mix_l_8k = np.zeros(needed_8k, dtype=np.float32)
+            mix_r_8k = np.zeros(needed_8k, dtype=np.float32)
+            byte_size = needed_8k * 2
+
+            with self.audio_lock:
+                for uid, q in list(self.audio_queues.items()):
+                    if str(uid) == str(self.local["id"]):
+                        continue
+                    try:
+                        p_meta = self.peers.get(uid, {})
+                        vl, vr = (1.0, 1.0) if p_meta.get("global") else self.spatial_calc(p_meta)
+
+                        if len(q) >= byte_size:
+                            chunk_bytes = bytes(q[:byte_size])
+                            del q[:byte_size]
+                            pcm = np.frombuffer(chunk_bytes, dtype=np.int16).astype(np.float32)
+                            self.last_pcm[uid] = pcm.copy()
+                            self.fade_pos[uid] = 0
+                            self.levels[uid] = float(np.abs(pcm).mean() * ((vl + vr) / 2.0))
+                            mix_l_8k += pcm * vl
+                            mix_r_8k += pcm * vr
+                        elif len(q) > 0:
+                            avail = len(q) // 2
+                            chunk_bytes = bytes(q[:avail * 2])
+                            del q[:avail * 2]
+                            pcm_part = np.frombuffer(chunk_bytes, dtype=np.int16).astype(np.float32)
+                            padded = np.zeros(needed_8k, dtype=np.float32)
+                            padded[:avail] = pcm_part
+                            if uid in self.last_pcm and len(self.last_pcm[uid]) > 0:
+                                last = self.last_pcm[uid]
+                                rem = needed_8k - avail
+                                rep_idx = np.arange(rem) % len(last)
+                                decay = np.linspace(1.0, 0.7, rem, endpoint=False)
+                                padded[avail:] = last[rep_idx] * decay
+                            self.last_pcm[uid] = padded.copy()
+                            self.fade_pos[uid] = 0
+                            self.levels[uid] = float(np.abs(padded).mean() * ((vl + vr) / 2.0))
+                            mix_l_8k += padded * vl
+                            mix_r_8k += padded * vr
+                        else:
+                            fade_p = self.fade_pos.get(uid, 0)
+                            if uid in self.last_pcm and fade_p < FADE_SAMPLES:
+                                last = self.last_pcm[uid]
+                                rep_idx = np.arange(needed_8k) % len(last)
+                                progress = (fade_p + np.arange(needed_8k)) / float(FADE_SAMPLES)
+                                env = np.clip(1.0 - progress, 0.0, 1.0).astype(np.float32)
+                                pcm_decay = last[rep_idx] * env
+                                self.fade_pos[uid] = fade_p + needed_8k
+                                self.levels[uid] = float(np.abs(pcm_decay).mean() * ((vl + vr) / 2.0))
+                                mix_l_8k += pcm_decay * vl
+                                mix_r_8k += pcm_decay * vr
+                            else:
+                                self.levels[uid] = 0.0
+                                self.last_pcm.pop(uid, None)
+                    except Exception:
+                        continue
+
+                if self.settings.get('hear_self', False) and not self.local["dead"]:
+                    if len(self.self_hear_buf) >= byte_size:
+                        chunk = bytes(self.self_hear_buf[:byte_size])
+                        del self.self_hear_buf[:byte_size]
+                        pcm = np.frombuffer(chunk, dtype=np.int16).astype(np.float32)
+                        mix_l_8k += pcm
+                        mix_r_8k += pcm
+
+            mix_l_hw = resample_audio(mix_l_8k, RATE, self.spk_rate)
+            mix_r_hw = resample_audio(mix_r_8k, RATE, self.spk_rate)
+
+            if len(mix_l_hw) < frames:
+                mix_l_hw = np.pad(mix_l_hw, (0, frames - len(mix_l_hw)))
+                mix_r_hw = np.pad(mix_r_hw, (0, frames - len(mix_r_hw)))
+            else:
+                mix_l_hw = mix_l_hw[:frames]
+                mix_r_hw = mix_r_hw[:frames]
+
+            master_vol = self.settings.get('master_vol', 1.0)
+            out_l = soft_clip(mix_l_hw, master_vol)
+            out_r = soft_clip(mix_r_hw, master_vol)
+
+            outdata[:, 0] = out_l
+            outdata[:, 1] = out_r
+        except Exception:
+            outdata.fill(0)
+
+    def on_mqtt_connect(self, client, userdata, flags, rc, *args):
+        code = getattr(rc, "value", rc)
+        print(f"[MQTT] Connected with code {code}")
+        if self.local["session"] > 0:
+            client.subscribe(f"tdvc/{self.local['session']}/#")
+            if self.local["id"] != 0:
+                client.publish(f"tdvc/{self.local['session']}/data/{self.local['id']}", json.dumps(self.local), qos=0, retain=True)
+
+    def on_mqtt_subscribe(self, client, userdata, mid, *args):
         print(f"[MQTT] Subscribed to session room")
 
     def on_mqtt_message(self, c, u, m):
@@ -251,254 +621,200 @@ class VoiceChat:
             topic_parts = m.topic.split("/")
             if "audio" in topic_parts:
                 uid = str(topic_parts[-1])
-                if uid == str(self.local["id"]): return
-                if uid not in self.audio_queues:
-                    self.audio_queues[uid] = bytearray()
-                    self.play_started[uid] = False
-                self.audio_queues[uid].extend(m.payload)
-                try:
-                    self.last_seen[uid] = time.time()
-                except: pass
-                try:
-                    self.fade_remaining[uid] = 0
-                    self.last_pcm.pop(uid, None)
-                    self.faded_out[uid] = False
-                except: pass
-                if len(self.audio_queues[uid]) > (RATE * 2 * MAX_QUEUE_SECONDS):
-                    self.audio_queues[uid] = self.audio_queues[uid][-(RATE * 2 * MAX_QUEUE_SECONDS):]
-            elif "data" in topic_parts:
-                if not m.payload:
-                    uid = str(topic_parts[-1])
-                    if uid in self.peers: del self.peers[uid]
-                    try: del self.audio_queues[uid]
-                    except: pass
-                    try: del self.play_started[uid]
-                    except: pass
-                    try: del self.levels[uid]
-                    except: pass
-                    try: del self.last_seen[uid]
-                    except: pass
+                if str(self.local["id"]) != "0" and uid == str(self.local["id"]):
                     return
-                p = json.loads(m.payload)
-                uid = str(p["id"])
-                if uid == str(self.local["id"]): return
-                self.peers[uid] = p
-                try: self.last_seen[uid] = time.time()
-                except: pass
-        except Exception as e: print(f"[MQTT ERR] {e}")
 
-    def audio_thread(self):
-        while self.running:
-            if self.local["session"] == 0:
-                time.sleep(1); continue
-            sin, sout = None, None
-            try:
-                print(f"[AUDIO] Reloading Hardware for Session {self.local['session']}")
-                sin = self.pa.open(format=FORMAT, channels=CHANNELS, rate=RATE, input=True, input_device_index=self.mic_id, frames_per_buffer=CHUNK)
-                sout = self.pa.open(format=FORMAT, channels=2, rate=RATE, output=True, output_device_index=self.spk_id)
-                self.restart_trigger = False
-                last_echo, echo_buf = -1, np.zeros(1, dtype=np.int16)
-                send_acc = bytearray()
+                raw_samples = np.frombuffer(m.payload, dtype=np.int16)
+                if len(raw_samples) == 0:
+                    return
 
-                while self.running and not self.restart_trigger:
-                    cur_echo = self.local.get("echo", 0)
-                    if cur_echo != last_echo:
-                        last_echo = cur_echo
-                        echo_buf = np.zeros(int(RATE * (max(0, cur_echo)/1000)), dtype=np.int16)
+                p_meta = self.peers.get(uid, {})
+                peer_rate = int(p_meta.get("rate", p_meta.get("samplerate", 0)))
+                now = time.time()
+                last_t = self.last_audio_time.get(uid, 0)
+                dt = now - last_t if last_t > 0 else 1.0
+                self.last_audio_time[uid] = now
 
-                    in_np = np.zeros(CHUNK, dtype=np.int16)
-                    try:
-                        raw = sin.read(CHUNK, exception_on_overflow=False)
-                        in_np = np.frombuffer(raw, dtype=np.int16)
-                        if self.settings['mic_gain'] != 1:
-                            in_np = (in_np.astype(np.float32) * self.settings['mic_gain']).clip(-32768, 32767).astype(np.int16)
+                if peer_rate <= 0:
+                    standard_rates = [8000, 11025, 12000, 16000, 22050, 24000, 32000, 44100, 48000, 96000]
+                    if 0.4 <= dt <= 2.5:
+                        est_rate = int(round(len(raw_samples) / dt))
+                        peer_rate = min(standard_rates, key=lambda r: abs(r - est_rate))
+                    elif len(raw_samples) in standard_rates:
+                        peer_rate = len(raw_samples)
+                    else:
+                        peer_rate = min(standard_rates, key=lambda r: abs(r - len(raw_samples)))
 
-                        self.levels[str(self.local["id"])] = np.abs(in_np).mean()
-                    except Exception as e:
-                        in_np = np.zeros(CHUNK, dtype=np.int16)
-                        self.levels[str(self.local["id"])] = 0
+                if peer_rate != RATE and peer_rate > 0:
+                    norm_samples = resample_audio(raw_samples, peer_rate, RATE)
+                else:
+                    norm_samples = raw_samples
 
-                    ec = (echo_buf[:CHUNK] * 0.4).astype(np.int16) if len(echo_buf) >= CHUNK else 0
-                    snd = np.add(in_np, ec, casting="unsafe")
-
-                    if len(echo_buf) >= CHUNK:
-                        echo_buf = np.roll(echo_buf, -CHUNK); echo_buf[-CHUNK:] = snd
-
-                    if not self.local["dead"]:
-                        send_acc.extend(snd.tobytes())
-                        if len(send_acc) >= (RATE * 2 * AUDIO_SNIP_SECONDS):
-                            self.client.publish(f"tdvc/{self.local['session']}/audio/{self.local['id']}", bytes(send_acc), qos=0)
-                            send_acc = bytearray()
-                    
-                    mix = np.zeros(CHUNK * 2, dtype=np.float32)
-                    byte_size = CHUNK * 2
-                    
-                    for uid, q in list(self.audio_queues.items()):
-                        try:
-                            p_meta = self.peers.get(uid, {})
-                            vl, vr = (1, 1) if p_meta.get("global") else self.spatial_calc(p_meta)
-
-                            one_sec_bytes = RATE * 2
-
-                            if self.faded_out.get(uid, False) and len(q) == 0:
-                                self.levels[uid] = 0
-                                try: self.play_started[uid] = False
-                                except: pass
-                                continue
-
-                            if not self.play_started.get(uid, False):
-                                if len(q) >= one_sec_bytes:
-                                    self.play_started[uid] = True
-                                else:
-                                    self.levels[uid] = 0
-                                    continue
-
-                            if len(q) >= byte_size:
-                                chunk_bytes = q[:byte_size]
-                                del q[:byte_size]
-                                pcm = np.frombuffer(chunk_bytes, dtype=np.int16).astype(np.float32)
-                                self.last_pcm[uid] = pcm.copy()
-                                self.fade_remaining[uid] = 0
-                                self.faded_out[uid] = False
-                                self.levels[uid] = np.abs(pcm).mean() * ((vl + vr) / 2)
-                                mix[0::2] += pcm * vl; mix[1::2] += pcm * vr
-                                continue
-
-                            available_bytes = len(q)
-                            pcm_out = np.zeros(CHUNK, dtype=np.float32)
-                            part_len = 0
-                            if available_bytes > 0:
-                                chunk_bytes = q[:available_bytes]
-                                del q[:available_bytes]
-                                part = np.frombuffer(chunk_bytes, dtype=np.int16).astype(np.float32)
-                                part_len = len(part)
-                                pcm_out[:part_len] = part
-
-                            if self.fade_remaining.get(uid, 0) <= 0:
-                                if uid in self.last_pcm:
-                                    self.fade_remaining[uid] = self.fade_total_samples
-                                else:
-                                    self.levels[uid] = 0
-                                    continue
-
-                            rem = self.fade_remaining.get(uid, 0)
-                            if rem <= 0:
-                                self.levels[uid] = 0
-                                continue
-
-                            fade_needed = CHUNK - part_len
-                            fade_samples = min(rem, fade_needed)
-                            if fade_samples > 0 and uid in self.last_pcm:
-                                last = self.last_pcm[uid]
-                                lt = len(last)
-                                idxs = np.arange(fade_samples)
-                                multipliers = ((rem - idxs) / float(self.fade_total_samples)).astype(np.float32)
-                                if fade_samples <= lt:
-                                    source = last[-fade_samples:]
-                                else:
-                                    pad_len = fade_samples - lt
-                                    source = np.concatenate((last, np.full(pad_len, last[-1], dtype=last.dtype)))
-                                pcm_out[part_len:part_len+fade_samples] = source[:fade_samples] * multipliers
-
-                                new_rem = rem - fade_samples
-                                self.fade_remaining[uid] = new_rem
-                                if new_rem <= 0:
-                                    self.faded_out[uid] = True
-                                    try: del self.last_pcm[uid]
-                                    except: pass
-
-                            self.levels[uid] = np.abs(pcm_out).mean() * ((vl + vr) / 2)
-                            mix[0::2] += pcm_out * vl; mix[1::2] += pcm_out * vr
-                        except: continue
-                    
-                    if self.settings['hear_self'] and not self.local["dead"]:
-                        mix[0::2] += snd.astype(np.float32); mix[1::2] += snd.astype(np.float32)
-                    
-                    out_pcm = (mix * self.settings['master_vol']).clip(-32768, 32767).astype(np.int16)
-                    try:
-                        sout.write(out_pcm.tobytes())
-                    except: pass
-
-            except Exception as e:
-                print(f"[AUDIO ERR] {e}")
-                time.sleep(1)
-            finally:
-                if sin: 
-                    try: sin.stop_stream(); sin.close()
-                    except: pass
-                if sout:
-                    try: sout.stop_stream(); sout.close()
-                    except: pass
+                with self.audio_lock:
+                    if uid not in self.audio_queues:
+                        self.audio_queues[uid] = bytearray()
+                    self.audio_queues[uid].extend(norm_samples.tobytes())
+                    self.last_seen[uid] = now
+                    if len(self.audio_queues[uid]) > (RATE * 2 * MAX_QUEUE_SECONDS):
+                        self.audio_queues[uid] = self.audio_queues[uid][-(RATE * 2 * MAX_QUEUE_SECONDS):]
+            elif "data" in topic_parts:
+                uid = str(topic_parts[-1])
+                if not m.payload or len(m.payload) == 0:
+                    with self.audio_lock:
+                        self.peers.pop(uid, None)
+                        self.audio_queues.pop(uid, None)
+                        self.levels.pop(uid, None)
+                        self.last_seen.pop(uid, None)
+                        self.last_pcm.pop(uid, None)
+                        self.fade_pos.pop(uid, None)
+                        self.last_audio_time.pop(uid, None)
+                    return
+                try:
+                    p = json.loads(m.payload.decode('utf-8'))
+                except Exception:
+                    return
+                p_id = str(p.get("id", uid))
+                if str(self.local["id"]) != "0" and (p_id == str(self.local["id"]) or uid == str(self.local["id"])):
+                    return
+                with self.audio_lock:
+                    self.peers[p_id] = p
+                    self.last_seen[p_id] = time.time()
+        except Exception as e:
+            print(f"[MQTT ERR] {e}")
 
     def spatial_calc(self, p):
-        if not p: return 0.5, 0.5
-        dx = p.get("x", 0) - self.local["x"]
-        dy = p.get("y", 0) - self.local["y"]
-        dz = p.get("z", 0) - self.local["z"]
-        dist = math.sqrt(dx*dx + dy*dy + dz*dz)
-        vol = max(0, 1 - (dist / 45))
-        pan = np.clip(dx / -15, -0.8, 0.8)
-        return vol * (1 - pan), vol * (1 + pan)
+        if not p:
+            return 0.5, 0.5
+        dx = float(p.get("x", 0)) - self.local["x"]
+        dy = float(p.get("y", 0)) - self.local["y"]
+        dz = float(p.get("z", 0)) - self.local["z"]
+        dist = math.sqrt(dx * dx + dy * dy + dz * dz)
+        vol = max(0.0, 1.0 - (dist / 45.0))
+        pan = np.clip(dx / -15.0, -0.8, 0.8)
+        return vol * (1.0 - pan), vol * (1.0 + pan)
 
     def teardown_monitor(self):
         ls = -1
-        while self.running:
-            if os.path.exists(SAVE_PATH):
-                try:
-                    with open(SAVE_PATH, 'r', encoding='utf-8') as f: xml = f.read()
-                    m = re.search(fr'<{SAVE_TAG}>(.*?)</{SAVE_TAG}>', xml, re.S)
-                    inner = m.group(1) if m else ""
-                    def g(k, default=0):
-                        mm = re.search(rf'<{k}\s+value="([^"]*)"', inner)
-                        return int(mm.group(1)) if mm else default
-                    cs = g("session", 0)
+        last_pub_time = 0
 
-                    if cs != ls:
-                        if ls > 0:
-                            self.client.publish(f"tdvc/{ls}/data/{self.local['id']}", payload=None, retain=True)
-                            self.client.unsubscribe(f"tdvc/{ls}/#")
-                        
-                        if cs > 0:
-                            print(f"[MONITOR] Joining Session {cs}")
-                            self.client.subscribe(f"tdvc/{cs}/#")
+        while self.running:
+            if TEST_MODE:
+                cs = int(TEST_DATA.get("session", 0))
+                current_userid = int(TEST_DATA.get("userid", 0))
+                current_name = str(TEST_DATA.get("name", "Tester"))
+                
+                if cs != ls:
+                    if ls > 0 and self.local["id"] != 0:
+                        self.client.publish(f"tdvc/{ls}/data/{self.local['id']}", payload=b"", retain=True)
+                        self.client.unsubscribe(f"tdvc/{ls}/#")
+                    if cs > 0:
+                        print(f"[MONITOR] Subscribing to Test Session {cs}")
+                        self.client.subscribe(f"tdvc/{cs}/#")
+                        with self.audio_lock:
                             self.peers.clear()
                             self.audio_queues.clear()
-                            self.play_started.clear()
-                        
-                        ls = cs
-                        self.restart_trigger = True
+                            self.levels.clear()
+                            self.last_pcm.clear()
+                            self.fade_pos.clear()
+                            self.last_audio_time.clear()
+                    ls = cs
 
-                    self.local.update({
-                        "id": g("userid", 0), 
-                        "x": g("pos_x", 0)/100, 
-                        "y": g("pos_y", 0)/100, 
-                        "z": g("pos_z", 0)/100, 
-                        "dead": g("isdead", 1), 
-                        "session": cs, 
-                        "global": g("global", 0), 
-                        "show_map": g("showmap", 0), 
-                        "echo": g("echo", 0)
-                    })
+                self.local.update({
+                    "id": current_userid,
+                    "name": current_name,
+                    "x": float(TEST_DATA.get("pos_x", 0.0)),
+                    "y": float(TEST_DATA.get("pos_y", 0.0)),
+                    "z": float(TEST_DATA.get("pos_z", 0.0)),
+                    "dead": int(TEST_DATA.get("isdead", 0)),
+                    "session": cs,
+                    "global": int(TEST_DATA.get("global", 0)),
+                    "show_map": int(TEST_DATA.get("showmap", 0)),
+                    "echo": int(TEST_DATA.get("echo", 0)),
+                    "rate": RATE
+                })
 
-                    if cs > 0:
-                         self.client.publish(f"tdvc/{cs}/data/{self.local['id']}", json.dumps(self.local), qos=0, retain=True)
-                    try:
+                with self.audio_lock:
+                    self.peers.pop(str(current_userid), None)
+
+                now = time.time()
+                if cs > 0 and self.local["id"] != 0 and (now - last_pub_time >= 0.5):
+                    self.client.publish(f"tdvc/{cs}/data/{self.local['id']}", json.dumps(self.local), qos=0, retain=True)
+                    last_pub_time = now
+            elif os.path.exists(SAVE_PATH):
+                try:
+                    with open(SAVE_PATH, 'r', encoding='utf-8', errors='ignore') as f:
+                        xml = f.read()
+                    m = re.search(fr'<{SAVE_TAG}>(.*?)</{SAVE_TAG}>', xml, re.S)
+                    if m:
+                        inner = m.group(1)
+
+                        def g(k, default=0):
+                            mm = re.search(rf'<{k}\s+value="([^"]*)"', inner)
+                            if not mm:
+                                return default
+                            val_str = mm.group(1).strip()
+                            try:
+                                return float(val_str) if '.' in val_str else int(val_str)
+                            except (ValueError, TypeError):
+                                return default
+
+                        cs = int(g("session", 0))
+                        current_userid = int(g("userid", 0))
+
+                        if cs != ls:
+                            if ls > 0 and self.local["id"] != 0:
+                                self.client.publish(f"tdvc/{ls}/data/{self.local['id']}", payload=b"", retain=True)
+                                self.client.unsubscribe(f"tdvc/{ls}/#")
+                            
+                            if cs > 0:
+                                print(f"[MONITOR] Subscribing to Session {cs}")
+                                self.client.subscribe(f"tdvc/{cs}/#")
+                                with self.audio_lock:
+                                    self.peers.clear()
+                                    self.audio_queues.clear()
+                                    self.levels.clear()
+                                    self.last_pcm.clear()
+                                    self.fade_pos.clear()
+                                    self.last_audio_time.clear()
+                            
+                            ls = cs
+
+                        self.local.update({
+                            "id": current_userid, 
+                            "x": float(g("pos_x", 0)) / 100.0, 
+                            "y": float(g("pos_y", 0)) / 100.0, 
+                            "z": float(g("pos_z", 0)) / 100.0, 
+                            "dead": int(g("isdead", 1)), 
+                            "session": cs, 
+                            "global": int(g("global", 0)), 
+                            "show_map": int(g("showmap", 0)), 
+                            "echo": int(g("echo", 0)),
+                            "rate": RATE
+                        })
+
+                        with self.audio_lock:
+                            self.peers.pop(str(current_userid), None)
+
                         now = time.time()
-                        stale = [uid for uid, ts in self.last_seen.items() if now - ts > STALE_TIMEOUT]
-                        for uid in stale:
-                            try: del self.peers[uid]
-                            except: pass
-                            try: del self.audio_queues[uid]
-                            except: pass
-                            try: del self.play_started[uid]
-                            except: pass
-                            try: del self.levels[uid]
-                            except: pass
-                            try: del self.last_seen[uid]
-                            except: pass
-                    except: pass
+                        if cs > 0 and self.local["id"] != 0 and (now - last_pub_time >= 0.5):
+                            self.client.publish(f"tdvc/{cs}/data/{self.local['id']}", json.dumps(self.local), qos=0, retain=True)
+                            last_pub_time = now
+
                 except Exception as e:
-                     print(f"[MONITOR ERR] {e}")
+                    print(f"[MONITOR ERR] {e}")
+
+            now = time.time()
+            with self.audio_lock:
+                stale = [uid for uid, ts in list(self.last_seen.items()) if now - ts > STALE_TIMEOUT]
+                for uid in stale:
+                    self.peers.pop(uid, None)
+                    self.audio_queues.pop(uid, None)
+                    self.levels.pop(uid, None)
+                    self.last_seen.pop(uid, None)
+                    self.last_pcm.pop(uid, None)
+                    self.fade_pos.pop(uid, None)
+                    self.last_audio_time.pop(uid, None)
+
             time.sleep(0.3)
 
     def is_teardown_running(self):
@@ -506,58 +822,108 @@ class VoiceChat:
         if psutil:
             for p in psutil.process_iter(['name']):
                 try:
-                    if p.info['name'] in t: return True
-                except: pass
+                    if p.info['name'] in t:
+                        return True
+                except Exception:
+                    pass
             return False
         try:
             o = subprocess.check_output(['tasklist'], shell=True).decode(errors='ignore')
             return any(x.lower() in o.lower() for x in t)
-        except: return False
+        except Exception:
+            return False
 
     def launch_teardown(self):
         try:
-            webbrowser.open("steam://rungameid/1167630"); return {'ok': True}
-        except Exception as e: return {'error': str(e)}
+            webbrowser.open("steam://rungameid/1167630")
+            return {'ok': True}
+        except Exception as e:
+            return {'error': str(e)}
 
 class Bridge:
-    def __init__(self, vc): self.vc = vc
+    def __init__(self, vc): 
+        self.vc = vc
+
     def init_devices(self):
         mics, spks = [], []
-        for i in range(self.vc.pa.get_device_count()):
-            try:
-                d = self.vc.pa.get_device_info_by_index(i)
-                if d['maxInputChannels'] > 0: mics.append({'id': i, 'name': d['name']})
-                if d['maxOutputChannels'] > 0: spks.append({'id': i, 'name': d['name']})
-            except: pass
-        dm, ds = 0, 0
-        try: dm = self.vc.pa.get_default_input_device_info()['index']
-        except: pass
-        try: ds = self.vc.pa.get_default_output_device_info()['index']
-        except: pass
-        return {'mics': mics, 'spks': spks, 'def_mic': dm, 'def_spk': ds}
-    def set_io(self, mic, spk): self.vc.mic_id, self.vc.spk_id = mic, spk; self.vc.restart_trigger = True
-    def update_settings(self, s): self.vc.settings = s
-    def is_teardown_running(self): return {'running': self.vc.is_teardown_running()}
-    def launch_teardown(self): return self.vc.launch_teardown()
+        try:
+            devices = sd.query_devices()
+            for idx, d in enumerate(devices):
+                if d['max_input_channels'] > 0:
+                    mics.append({'id': idx, 'name': d['name']})
+                if d['max_output_channels'] > 0:
+                    spks.append({'id': idx, 'name': d['name']})
+
+            def_in, def_out = sd.default.device
+            if def_in is None or def_in < 0:
+                def_in = mics[0]['id'] if mics else 0
+            if def_out is None or def_out < 0:
+                def_out = spks[0]['id'] if spks else 0
+        except Exception as e:
+            print(f"[DEVICE ERR] {e}")
+            def_in, def_out = 0, 0
+
+        return {'mics': mics, 'spks': spks, 'def_mic': def_in, 'def_spk': def_out}
+
+    def set_io(self, mic, spk): 
+        self.vc.set_io(mic, spk)
+
+    def update_settings(self, s): 
+        self.vc.settings = s
+
+    def is_teardown_running(self): 
+        return {'running': self.vc.is_teardown_running()}
+
+    def launch_teardown(self): 
+        return self.vc.launch_teardown()
 
 def gui_updater(vc, win):
     while vc.running:
         try:
             plist = []
-            plist.append({"id": vc.local["id"], "name": vc.local["name"], "vol": min(100, int(vc.levels.get(str(vc.local["id"]), 0)/10)), "status": "DEAD" if vc.local["dead"] else "LIVE", "local": True, "x": vc.local["x"], "y": vc.local["y"], "z": vc.local["z"], "echo": vc.local["echo"]})
-            for uid, p in vc.peers.items():
-                plist.append({"id": uid, "name": p.get("name", "Player"), "vol": min(100, int(vc.levels.get(uid, 0)/10)), "status": "DEAD" if p.get("dead") else "LIVE", "local": False, "x": p.get("x", 0), "y": p.get("y", 0), "z": p.get("z", 0), "echo": p.get("echo", 0)})
+            plist.append({
+                "id": vc.local["id"],
+                "name": vc.local["name"],
+                "vol": min(100, int(vc.levels.get(str(vc.local["id"]), 0) / 10)),
+                "status": "DEAD" if vc.local["dead"] else "LIVE",
+                "local": True,
+                "x": vc.local["x"],
+                "y": vc.local["y"],
+                "z": vc.local["z"],
+                "echo": vc.local["echo"]
+            })
+            with vc.audio_lock:
+                peer_items = list(vc.peers.items())
+            for uid, p in peer_items:
+                if str(uid) == str(vc.local["id"]):
+                    continue
+                plist.append({
+                    "id": uid,
+                    "name": p.get("name", f"Player {uid}"),
+                    "vol": min(100, int(vc.levels.get(uid, 0) / 10)),
+                    "status": "DEAD" if p.get("dead") else "LIVE",
+                    "local": False,
+                    "x": p.get("x", 0),
+                    "y": p.get("y", 0),
+                    "z": p.get("z", 0),
+                    "echo": p.get("echo", 0)
+                })
             win.evaluate_js(f"render('{json.dumps({'session': vc.local['session'], 'players': plist, 'show_map': vc.local['show_map']})}')")
-        except: pass
+        except Exception:
+            pass
         time.sleep(0.1)
 
 if __name__ == "__main__":
     if force_reset_session():
         v = VoiceChat()
         threading.Thread(target=v.teardown_monitor, daemon=True).start()
-        threading.Thread(target=v.audio_thread, daemon=True).start()
         w = webview.create_window('TeardownVC', html=HTML, js_api=Bridge(v), width=400, height=600)
         threading.Thread(target=gui_updater, args=(v, w), daemon=True).start()
         webview.start()
-        if v.local["session"] > 0: v.client.publish(f"tdvc/{v.local['session']}/data/{v.local['id']}", payload=None, retain=True)
+        
         v.running = False
+        v.stop_audio_streams()
+        if v.local["session"] > 0 and v.local["id"] != 0:
+            v.client.publish(f"tdvc/{v.local['session']}/data/{v.local['id']}", payload=b"", retain=True)
+        v.client.loop_stop()
+        v.client.disconnect()
