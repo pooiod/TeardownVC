@@ -9,12 +9,12 @@ TeardownVC is a simple proximity voice chat system for Teardown.
 - Proximity voice chat
 - Global voice chat
 - Automatic mute on player death
+- Real time echo effects
 
 ## Planned features
-- Cave echoing
 - Multiple audio sources (ex: walkie-talkies)
 - Doppler effect
-- More audio effects
+- Audio muffling when in water
 
 ## How it works
 The Teardown mod writes the player’s position to `%LocalAppData%\Teardown\savegame.xml` <br>
