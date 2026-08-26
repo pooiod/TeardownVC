@@ -1,7 +1,109 @@
 #version 2
 
-local VERSION = 2
+local VERSION = 3
 local cache = {}
+
+local RAYS_PER_FRAME = 10
+local MAX_BOUNCES = 6
+local RAY_MAX_DIST = 100
+local SPEED_OF_SOUND = 343
+local LERP_SPEED = 12
+local PLAYER_HEIGHT_OFFSET = 1.6
+local MIN_BOUNCE_THRESHOLD = 0.45
+local MIN_SURFACE_HITS = 2
+
+local CLIENT_URL = "https://github.com/pooiod/TeardownVC/releases"
+
+local ReflectivityMap = {
+    metal = 1.35,
+    hardmetal = 1.35,
+    masonry = 1.15,
+    brick = 1.15,
+    concrete = 0.9,
+    rock = 0.95,
+    glass = 0.75,
+    plaster = 0.45,
+    wood = 0.25,
+    plastic = 0.4,
+    sand = 0.3,
+    dirt = 0.25,
+    water = 0.8,
+    snow = 0.2,
+    mud = 0.3,
+    rubber = 0.2,
+    cloth = 0.05,
+    fabric = 0.05,
+    foliage = 0.05,
+    leaves = 0.05,
+    bush = 0.05,
+    tree = 0.15,
+    bark = 0.15,
+    grass = 0.1,
+    carpet = 0.02
+}
+
+local SmoothnessMap = {
+    metal = 0.95,
+    hardmetal = 0.95,
+    masonry = 0.7,
+    brick = 1.0,
+    concrete = 0.5,
+    rock = 0.6,
+    glass = 1.0,
+    plaster = 0.5,
+    wood = 0.35,
+    plastic = 0.7,
+    sand = 0.2,
+    dirt = 0.2,
+    water = 0.99,
+    snow = 0.4,
+    mud = 0.3,
+    rubber = 0.6,
+    cloth = 0.3,
+    fabric = 0.3,
+    foliage = 0.1,
+    leaves = 0.1,
+    bush = 0.1,
+    tree = 0.2,
+    bark = 0.2,
+    grass = 0.2,
+    carpet = 0.1,
+    air = 1.0
+}
+
+local AbsorptionMap = {
+    metal = 0.01,
+    hardmetal = 0.01,
+    masonry = 0.03,
+    brick = 0.03,
+    concrete = 0.03,
+    rock = 0.03,
+    glass = 0.12,
+    plaster = 0.42,
+    wood = 0.48,
+    plastic = 0.3,
+    sand = 0.5,
+    dirt = 0.55,
+    water = 0.05,
+    snow = 0.8,
+    mud = 0.6,
+    rubber = 0.65,
+    cloth = 0.95,
+    fabric = 0.95,
+    foliage = 0.95,
+    leaves = 0.95,
+    bush = 0.95,
+    tree = 0.8,
+    bark = 0.8,
+    grass = 0.75,
+    carpet = 0.98,
+    air = 0.5
+}
+
+local IsMetalMap = {
+    metal = 1,
+    hardmetal = 1
+}
 
 local notif_duration = 5
 local notif_timer = 0
@@ -10,6 +112,7 @@ local notif_anim = 0
 
 local window_open = false
 local window_anim = 0
+local copied_timer = 0
 
 local global_enabled = false
 
@@ -21,6 +124,138 @@ local NOTIF_WIDTH = 600
 local NOTIF_HEIGHT = 50
 local BOX_ASSET = "ui/common/box-solid-6.png"
 
+local current_echo = 0
+local smoothed_echo = 0
+
+local trace_data = {
+    totalStarts = 0,
+    totalCasts = 0,
+    totalHits = 0,
+    totalHitDistance = 0,
+    totalSmoothness = 0,
+    totalMetal = 0,
+    totalAbsorption = 0
+}
+
+function reflectVector(dir, normal)
+    local dot = dir[1] * normal[1] + dir[2] * normal[2] + dir[3] * normal[3]
+    local factor = -2 * dot
+    return Vec(
+        dir[1] + factor * normal[1],
+        dir[2] + factor * normal[2],
+        dir[3] + factor * normal[3]
+    )
+end
+
+function getRandomUnitVector()
+    local theta = math.random() * 2 * math.pi
+    local z = math.random() * 2 - 1
+    local r = math.sqrt(math.max(0, 1 - z * z))
+    return Vec(r * math.cos(theta), r * math.sin(theta), z)
+end
+
+function recursiveCast(pos, dir, bounceCount)
+    trace_data.totalCasts = trace_data.totalCasts + 1
+    local hit, dist, normal, shape = QueryRaycast(pos, dir, RAY_MAX_DIST)
+
+    if hit and dist > 0.3 then
+        trace_data.totalHits = trace_data.totalHits + 1
+        trace_data.totalHitDistance = trace_data.totalHitDistance + dist
+
+        local hit_pos = Vec(
+            pos[1] + dir[1] * dist,
+            pos[2] + dir[2] * dist,
+            pos[3] + dir[3] * dist
+        )
+
+        local mat_type = ""
+        if shape and shape ~= 0 and GetShapeMaterialAtPosition then
+            mat_type = GetShapeMaterialAtPosition(shape, hit_pos)
+        end
+
+        local refl = ReflectivityMap[mat_type] or 0
+        local smooth = SmoothnessMap[mat_type] or 0
+        local absorp = AbsorptionMap[mat_type] or 0.5
+
+        if IsMetalMap[mat_type] then
+            trace_data.totalMetal = trace_data.totalMetal + 1
+        end
+
+        trace_data.totalSmoothness = trace_data.totalSmoothness + smooth
+        trace_data.totalAbsorption = trace_data.totalAbsorption + absorp
+
+        if bounceCount < MAX_BOUNCES and refl > 0.15 then
+            local next_bounce_inc = 1 / math.max(0.3, refl)
+            local ref_dir = reflectVector(dir, normal)
+            local nudge_pos = Vec(
+                hit_pos[1] + ref_dir[1] * 0.05,
+                hit_pos[2] + ref_dir[2] * 0.05,
+                hit_pos[3] + ref_dir[3] * 0.05
+            )
+            recursiveCast(nudge_pos, ref_dir, bounceCount + next_bounce_inc)
+        end
+    end
+end
+
+function calculateEcho(pos, dt)
+    trace_data.totalStarts = 0
+    trace_data.totalCasts = 0
+    trace_data.totalHits = 0
+    trace_data.totalHitDistance = 0
+    trace_data.totalSmoothness = 0
+    trace_data.totalMetal = 0
+    trace_data.totalAbsorption = 0
+
+    local eye_pos = Vec(pos[1], pos[2] + PLAYER_HEIGHT_OFFSET, pos[3])
+
+    for i = 1, RAYS_PER_FRAME do
+        trace_data.totalStarts = trace_data.totalStarts + 1
+        local dir = getRandomUnitVector()
+        recursiveCast(eye_pos, dir, 0)
+    end
+
+    if trace_data.totalStarts == 0 or trace_data.totalHits < MIN_SURFACE_HITS then
+        smoothed_echo = smoothed_echo + (0 - smoothed_echo) * math.min(1, dt * LERP_SPEED * 2)
+        if smoothed_echo < 1 then smoothed_echo = 0 end
+        current_echo = math.floor(smoothed_echo)
+        return current_echo
+    end
+
+    local avg_bounces = trace_data.totalHits / trace_data.totalStarts
+    local avg_distance = trace_data.totalHitDistance / trace_data.totalHits
+    local avg_absorption = trace_data.totalAbsorption / trace_data.totalHits
+
+    if avg_bounces < MIN_BOUNCE_THRESHOLD or avg_absorption > 0.85 then
+        smoothed_echo = smoothed_echo + (0 - smoothed_echo) * math.min(1, dt * LERP_SPEED * 2)
+        if smoothed_echo < 1 then smoothed_echo = 0 end
+        current_echo = math.floor(smoothed_echo)
+        return current_echo
+    end
+
+    local enclosure_energy = math.max(0, (avg_bounces - MIN_BOUNCE_THRESHOLD) / 1.6)
+    local material_reflectivity = math.max(0, 1 - (avg_absorption * 1.15))
+    local acoustic_power = math.min(1.4, enclosure_energy * material_reflectivity)
+
+    if acoustic_power <= 0.05 then
+        smoothed_echo = smoothed_echo + (0 - smoothed_echo) * math.min(1, dt * LERP_SPEED * 2)
+        if smoothed_echo < 1 then smoothed_echo = 0 end
+        current_echo = math.floor(smoothed_echo)
+        return current_echo
+    end
+
+    local raw_ms = (2 * avg_distance / SPEED_OF_SOUND) * 1000 * acoustic_power
+    local target_ms = math.floor(raw_ms)
+
+    if target_ms < 6 then
+        target_ms = 0
+    end
+
+    smoothed_echo = smoothed_echo + (target_ms - smoothed_echo) * math.min(1, dt * LERP_SPEED)
+    if smoothed_echo < 1 then smoothed_echo = 0 end
+    current_echo = math.floor(smoothed_echo + 0.5)
+    return current_echo
+end
+
 function updateInt(key, val, force)
     if force or cache[key] ~= val then
         SetInt("savegame.mod." .. key, val)
@@ -29,7 +264,9 @@ function updateInt(key, val, force)
 end
 
 function server.init()
-    math.randomseed(os.time())
+    if GetTime then
+        math.randomseed(math.floor(GetTime() * 1000))
+    end
     shared.id_requests = {}
     shared.id_responses = {}
     shared.user_map = {}
@@ -89,7 +326,13 @@ function client.tick(dt)
 
     updateInt("global", global_enabled and 1 or 0)
     updateInt("showmap", shared.ShowPlayerMap or 0)
-    updateInt("echo", 0)
+    
+    local echo_val = calculateEcho(pos, dt)
+    updateInt("echo", echo_val)
+
+    if copied_timer > 0 then
+        copied_timer = math.max(0, copied_timer - dt)
+    end
 
     if notif_active and not window_open then
         notif_timer = notif_timer + dt
@@ -175,9 +418,31 @@ function client.draw(dt)
                 UiText("Please download the latest version from the GitHub releases.")
 
                 UiTranslate(0, 40)
-                local link = "[[https://github.com/pooiod/TeardownVC/releases;label=github.com/pooiod/TeardownVC/releases;color=#4488FF;underline=true]]"
-                UiFont("bold.ttf", 24)
-                UiText(link)
+                local link_w = 440
+                local link_h = 32
+                UiPush()
+                    UiTranslate(-link_w/2, -link_h/2)
+                    local link_hover = UiIsMouseInRect(link_w, link_h)
+                    if link_hover and InputPressed("lmb") then
+                        copied_timer = 2.5
+                        if SetClipboardText then
+                            SetClipboardText(CLIENT_URL)
+                        end
+                        if Command then
+                            Command("game.openurl " .. CLIENT_URL)
+                        end
+                    end
+                UiPop()
+
+                if copied_timer > 0 then
+                    -- UiFont("bold.ttf", 20)
+                    -- UiColor(0.3, 1, 0.4, alpha)
+                    -- UiText("")
+                else
+                    local link = "[[https://github.com/pooiod/TeardownVC/releases;label=github.com/pooiod/TeardownVC/releases;color=#4488FF;underline=true]]"
+                    UiFont("bold.ttf", 24)
+                    UiText(link)
+                end
             UiPop()
 
             UiPush()
